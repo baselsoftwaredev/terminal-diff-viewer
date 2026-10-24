@@ -1,5 +1,6 @@
 use crate::{
     diff::{self, ChangeKind, FileDiff, Kind, Snapshot},
+    file_tree::{self, Row as FileRow},
     highlight::{Colors, Highlighter},
     refresh::{Parameters, Refresher},
     setup::{Action as SetupAction, Setup},
@@ -22,6 +23,7 @@ use ratatui::{
     Frame,
 };
 use std::{
+    collections::HashSet,
     io::{self, stdout},
     sync::Arc,
     time::{Duration, Instant},
@@ -60,6 +62,11 @@ struct Previous {
     x: u16,
 }
 
+enum Drag {
+    Resize,
+    Scroll { grab: u16 },
+}
+
 struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -89,6 +96,14 @@ struct App {
     sidebar: bool,
     file_focus: bool,
     file_state: ListState,
+    tree: Vec<FileRow>,
+    collapsed: HashSet<String>,
+    tree_cursor: usize,
+    sidebar_width: Option<u16>,
+    sidebar_edge: Rect,
+    scrollbar: Rect,
+    screen_width: u16,
+    drag: Option<Drag>,
     picker: Option<String>,
     pick: usize,
     help: bool,
@@ -110,6 +125,8 @@ impl App {
         if let Some(file) = files.first_mut() {
             Arc::make_mut(file).load_current();
         }
+        let tree = file_tree::rows(files.iter().map(|f| f.name.as_str()), &HashSet::new());
+        let tree_cursor = tree.iter().position(|r| r.file == Some(0)).unwrap_or(0);
         Self {
             setup,
             opts,
@@ -131,6 +148,14 @@ impl App {
             sidebar: true,
             file_focus: false,
             file_state: ListState::default(),
+            tree,
+            collapsed: HashSet::new(),
+            tree_cursor,
+            sidebar_width: None,
+            sidebar_edge: Rect::default(),
+            scrollbar: Rect::default(),
+            screen_width: 0,
+            drag: None,
             picker: None,
             pick: 0,
             help: false,
@@ -148,12 +173,116 @@ impl App {
         self.selected = n.min(self.files.len().saturating_sub(1));
         self.top = 0;
         self.x = 0;
-        self.file_state.select(Some(self.selected));
+        self.reveal_selected();
         self.cursor = 0;
         self.previous = None;
         if let Some(file) = self.files.get_mut(self.selected) {
             Arc::make_mut(file).load_current();
         }
+    }
+
+    fn rebuild_tree(&mut self) {
+        self.tree = file_tree::rows(self.files.iter().map(|f| f.name.as_str()), &self.collapsed);
+        self.tree_cursor = self.tree_cursor.min(self.tree.len().saturating_sub(1));
+        self.clamp_tree_scroll();
+    }
+
+    fn reveal_selected(&mut self) {
+        let mut changed = false;
+        if let Some(file) = self.files.get(self.selected) {
+            let mut parent = file.name.as_str();
+            while let Some((path, _)) = parent.rsplit_once('/') {
+                changed |= self.collapsed.remove(path);
+                parent = path;
+            }
+        }
+        if changed {
+            self.rebuild_tree();
+        }
+        self.tree_cursor = self
+            .tree
+            .iter()
+            .position(|r| r.file == Some(self.selected))
+            .unwrap_or(0);
+        self.ensure_tree_cursor();
+    }
+
+    fn clamp_tree_scroll(&mut self) {
+        let max = self
+            .tree
+            .len()
+            .saturating_sub(usize::from(self.list_area.height));
+        *self.file_state.offset_mut() = self.file_state.offset().min(max);
+    }
+
+    fn ensure_tree_cursor(&mut self) {
+        let height = usize::from(self.list_area.height.max(1));
+        let offset = self.file_state.offset();
+        *self.file_state.offset_mut() = if self.tree_cursor < offset {
+            self.tree_cursor
+        } else if self.tree_cursor >= offset + height {
+            self.tree_cursor + 1 - height
+        } else {
+            offset
+        };
+        self.clamp_tree_scroll();
+    }
+
+    fn toggle_directory(&mut self) {
+        if let Some(row) = self.tree.get(self.tree_cursor).filter(|r| r.file.is_none()) {
+            let path = row.path.clone();
+            if !self.collapsed.remove(&path) {
+                self.collapsed.insert(path);
+            }
+            self.last_click = None;
+            self.rebuild_tree();
+            self.ensure_tree_cursor();
+        }
+    }
+
+    fn move_tree(&mut self, delta: isize) {
+        self.tree_cursor = self
+            .tree_cursor
+            .saturating_add_signed(delta)
+            .min(self.tree.len().saturating_sub(1));
+        if let Some(file) = self.tree.get(self.tree_cursor).and_then(|r| r.file) {
+            self.select(file);
+        }
+        self.ensure_tree_cursor();
+    }
+
+    fn thumb(&self) -> (u16, u16) {
+        let height = usize::from(self.scrollbar.height);
+        if height == 0 {
+            return (0, 0);
+        }
+        let count = self.tree.len().max(1);
+        let size = (height * height / count).clamp(1, height.max(1));
+        let max = count.saturating_sub(height);
+        let start = if max == 0 {
+            0
+        } else {
+            self.file_state.offset() * (height - size) / max
+        };
+        (start as u16, size as u16)
+    }
+
+    fn drag_scroll(&mut self, row: u16, grab: u16) {
+        let (_, size) = self.thumb();
+        let travel = self.scrollbar.height.saturating_sub(size);
+        let position = row
+            .saturating_sub(self.scrollbar.y)
+            .saturating_sub(grab)
+            .min(travel);
+        let max = self
+            .tree
+            .len()
+            .saturating_sub(usize::from(self.scrollbar.height));
+        *self.file_state.offset_mut() = if travel == 0 {
+            0
+        } else {
+            usize::from(position) * max / usize::from(travel)
+        };
     }
 
     fn reload(&mut self) {
@@ -177,6 +306,7 @@ impl App {
     }
 
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        let tree_path = self.tree.get(self.tree_cursor).map(|r| r.path.clone());
         let name = self.files.get(self.selected).map(|f| f.name.clone());
         let selected = snapshot
             .files
@@ -189,11 +319,13 @@ impl App {
         if let Some(file) = self.files.get_mut(selected) {
             Arc::make_mut(file).load_current();
         }
-        self.file_state.select(if self.files.is_empty() {
-            None
-        } else {
-            Some(selected)
-        });
+        self.rebuild_tree();
+        self.tree_cursor = self
+            .tree
+            .iter()
+            .position(|r| Some(&r.path) == tree_path.as_ref())
+            .or_else(|| self.tree.iter().position(|r| r.file == Some(selected)))
+            .unwrap_or(self.tree_cursor);
         self.clamp();
         self.cursor = self
             .cursor
@@ -517,14 +649,22 @@ impl App {
             KeyCode::Char('p') => self.hunk(false),
             KeyCode::Enter => {
                 if self.file_focus {
-                    self.file_focus = false;
+                    if self
+                        .tree
+                        .get(self.tree_cursor)
+                        .is_some_and(|r| r.file.is_none())
+                    {
+                        self.toggle_directory();
+                    } else {
+                        self.file_focus = false;
+                    }
                 } else if self.view == View::Current {
                     self.inspect_previous();
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.file_focus {
-                    self.select(self.selected.saturating_add(1));
+                    self.move_tree(1);
                 } else if self.view == View::Current {
                     self.move_cursor(1);
                 } else {
@@ -533,11 +673,32 @@ impl App {
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.file_focus {
-                    self.select(self.selected.saturating_sub(1));
+                    self.move_tree(-1);
                 } else if self.view == View::Current {
                     self.move_cursor(-1);
                 } else {
                     self.scroll(-1);
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') if self.file_focus => {
+                if let Some(row) = self.tree.get(self.tree_cursor).filter(|r| r.file.is_none()) {
+                    if self.collapsed.contains(&row.path) {
+                        self.toggle_directory();
+                    } else {
+                        self.move_tree(1);
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') if self.file_focus => {
+                if let Some(row) = self.tree.get(self.tree_cursor) {
+                    if row.file.is_none() && !self.collapsed.contains(&row.path) {
+                        self.toggle_directory();
+                    } else if let Some((parent, _)) = row.path.rsplit_once('/') {
+                        if let Some(index) = self.tree.iter().position(|r| r.path == parent) {
+                            self.tree_cursor = index;
+                            self.ensure_tree_cursor();
+                        }
+                    }
                 }
             }
             KeyCode::Right | KeyCode::Char('l') => self.x = self.x.saturating_add(4),
@@ -560,6 +721,10 @@ impl App {
     }
 
     fn mouse(&mut self, event: event::MouseEvent) {
+        if event.kind == MouseEventKind::Up(MouseButton::Left) {
+            self.drag = None;
+            return;
+        }
         if let Some(setup) = &mut self.setup {
             let action = setup.mouse(event);
             self.setup_action(action);
@@ -596,6 +761,21 @@ impl App {
         if self.help || self.picker.is_some() {
             return;
         }
+        if event.kind == MouseEventKind::Drag(MouseButton::Left) {
+            match self.drag {
+                Some(Drag::Resize) => {
+                    self.sidebar_width = Some(
+                        event
+                            .column
+                            .saturating_add(1)
+                            .clamp(20, self.screen_width.saturating_sub(30).max(20)),
+                    )
+                }
+                Some(Drag::Scroll { grab }) => self.drag_scroll(event.row, grab),
+                None => {}
+            }
+            return;
+        }
         let inside = |r: Rect| r.contains((event.column, event.row).into());
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if event.row == 0 => {
@@ -610,19 +790,41 @@ impl App {
                     self.open_picker();
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar_edge) => {
+                self.drag = Some(Drag::Resize);
+                self.last_click = None;
+            }
+            MouseEventKind::Down(MouseButton::Left) if inside(self.scrollbar) => {
+                let (start, size) = self.thumb();
+                let position = event.row - self.scrollbar.y;
+                let grab = if position >= start && position < start + size {
+                    position - start
+                } else {
+                    size / 2
+                };
+                self.drag = Some(Drag::Scroll { grab });
+                self.drag_scroll(event.row, grab);
+                self.last_click = None;
+            }
             MouseEventKind::Down(MouseButton::Left) if inside(self.list_area) => {
                 let n = self.file_state.offset() + usize::from(event.row - self.list_area.y);
-                if n < self.files.len() {
-                    let double = self
-                        .last_click
-                        .is_some_and(|(i, t)| i == n && t.elapsed() < Duration::from_millis(400));
-                    self.select(n);
+                if let Some(row) = self.tree.get(n) {
+                    let file = row.file;
+                    self.tree_cursor = n;
                     self.file_focus = true;
-                    if double {
-                        self.sidebar = false;
-                        self.file_focus = false;
+                    if let Some(file) = file {
+                        let double = self.last_click.is_some_and(|(i, t)| {
+                            i == file && t.elapsed() < Duration::from_millis(400)
+                        });
+                        self.select(file);
+                        if double {
+                            self.sidebar = false;
+                            self.file_focus = false;
+                        }
+                        self.last_click = Some((file, Instant::now()));
+                    } else {
+                        self.toggle_directory();
                     }
-                    self.last_click = Some((n, Instant::now()));
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if inside(self.body_area) => {
@@ -643,11 +845,14 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if inside(self.list_area) => {
-                if event.kind == MouseEventKind::ScrollDown {
-                    self.select(self.selected.saturating_add(1));
-                } else {
-                    self.select(self.selected.saturating_sub(1));
-                }
+                *self.file_state.offset_mut() = self.file_state.offset().saturating_add_signed(
+                    if event.kind == MouseEventKind::ScrollDown {
+                        3
+                    } else {
+                        -3
+                    },
+                );
+                self.clamp_tree_scroll();
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if inside(self.body_area) => {
                 let down = event.kind == MouseEventKind::ScrollDown;
@@ -671,6 +876,10 @@ impl App {
         self.update_yes = Rect::default();
         self.update_no = Rect::default();
         let area = frame.area();
+        self.screen_width = area.width;
+        self.list_area = Rect::default();
+        self.sidebar_edge = Rect::default();
+        self.scrollbar = Rect::default();
         frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
         if area.width < 30 || area.height < 6 {
             frame.render_widget(Paragraph::new("Resize to at least 30 × 6. q quits."), area);
@@ -700,7 +909,9 @@ impl App {
         let show_sidebar = self.sidebar && area.width >= 65;
         let columns = Layout::horizontal([
             Constraint::Length(if show_sidebar {
-                (area.width / 4).clamp(20, 38)
+                self.sidebar_width
+                    .unwrap_or((area.width / 4).clamp(20, 38))
+                    .clamp(20, area.width.saturating_sub(30).max(20))
             } else {
                 0
             }),
@@ -714,31 +925,73 @@ impl App {
                 .title(format!(" Files · {} ", self.files.len()))
                 .border_style(Style::default().fg(if self.file_focus { ACCENT } else { MUTED }));
             self.list_area = block.inner(columns[0]);
+            self.sidebar_edge = Rect::new(
+                columns[0].right() - 1,
+                self.list_area.y,
+                1,
+                self.list_area.height,
+            );
+            self.clamp_tree_scroll();
             let items: Vec<ListItem> = self
-                .files
+                .tree
                 .iter()
-                .map(|f| {
-                    let (a, d) = f.counts();
-                    ListItem::new(format!(
-                        "{}{} +{a} -{d}",
-                        if f.is_new { "new " } else { "" },
-                        safe_name(&f.name)
-                    ))
+                .enumerate()
+                .skip(self.file_state.offset())
+                .take(usize::from(self.list_area.height))
+                .map(|(index, row)| {
+                    let indent = "  ".repeat(row.depth);
+                    let label = if let Some(file) = row.file {
+                        let f = &self.files[file];
+                        let (a, d) = f.counts();
+                        format!(
+                            "{indent}{}{} +{a} -{d}",
+                            if f.is_new { "new " } else { "" },
+                            safe_name(&row.label)
+                        )
+                    } else {
+                        format!(
+                            "{indent}{} {}/",
+                            if self.collapsed.contains(&row.path) {
+                                "▸"
+                            } else {
+                                "▾"
+                            },
+                            safe_name(&row.label)
+                        )
+                    };
+                    let active = if self.file_focus {
+                        index == self.tree_cursor
+                    } else {
+                        row.file == Some(self.selected)
+                    };
+                    ListItem::new(label).style(if active {
+                        Style::default().bg(Color::Rgb(42, 61, 78)).fg(ACCENT)
+                    } else {
+                        Style::default()
+                    })
                 })
                 .collect();
-            self.file_state.select(if self.files.is_empty() {
-                None
-            } else {
-                Some(self.selected)
-            });
-            frame.render_stateful_widget(
-                List::new(items)
-                    .block(block)
-                    .highlight_style(Style::default().bg(Color::Rgb(42, 61, 78)).fg(ACCENT))
-                    .highlight_symbol("› "),
-                columns[0],
-                &mut self.file_state,
-            );
+            frame.render_widget(block, columns[0]);
+            let mut content = self.list_area;
+            if self.tree.len() > usize::from(content.height) && content.height > 0 {
+                self.scrollbar = Rect::new(content.right() - 1, content.y, 1, content.height);
+                content.width = content.width.saturating_sub(1);
+            }
+            frame.render_widget(List::new(items), content);
+            if self.scrollbar.height > 0 {
+                let (start, size) = self.thumb();
+                for y in 0..self.scrollbar.height {
+                    frame.render_widget(
+                        Paragraph::new(if y >= start && y < start + size {
+                            "█"
+                        } else {
+                            "│"
+                        })
+                        .style(Style::default().fg(MUTED)),
+                        Rect::new(self.scrollbar.x, self.scrollbar.y + y, 1, 1),
+                    );
+                }
+            }
         }
         let title = self
             .files
@@ -921,13 +1174,13 @@ impl App {
         } else if self.help {
             let popup = centered(area, 74, 22);
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new("Mouse\n  Click files to select; click changed lines for previous code\n  Wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan horizontally\n  Tab / Enter    Switch focus / inspect previous code\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Cycle current/unified/split / sidebar\n  s / r          Toggle staged changes / refresh\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
+            frame.render_widget(Paragraph::new("Mouse\n  Click folders to collapse; click files to select\n  Drag the file pane border to resize; drag its scrollbar to scroll\n  Click changed lines for previous code; wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan code / collapse or expand folders\n  Tab / Enter    Switch focus / inspect previous code\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Cycle current/unified/split / sidebar\n  s / r          Toggle staged changes / refresh\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
                 .block(Block::bordered().title(" Shortcuts ")).style(Style::default().bg(BG).fg(FG)), popup);
         } else if let Some(query) = &self.picker {
             let popup = centered(area, 70, 18);
             frame.render_widget(Clear, popup);
             let block = Block::bordered()
-                .title(format!(" Find file: {}▏ ", query))
+                .title(format!(" Find file: {query}▏ "))
                 .border_style(Style::default().fg(ACCENT))
                 .style(Style::default().bg(BG).fg(FG));
             let matches = self.matches();
@@ -1221,7 +1474,7 @@ mod tests {
         let click = event::MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: app.list_area.x + 1,
-            row: app.list_area.y + 1,
+            row: app.list_area.y + 2,
             modifiers: KeyModifiers::NONE,
         };
         app.mouse(click);
@@ -1236,6 +1489,103 @@ mod tests {
         });
         assert_eq!(app.x, 4);
     }
+    #[test]
+    fn folders_collapse_survive_refresh_and_picker_reveals_selection() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(Options::default(), Snapshot::from_patch(diff::DEMO));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let click = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.list_area.x,
+            row: app.list_area.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(click);
+        assert!(app.collapsed.contains("src"));
+        assert_eq!(app.tree.len(), 2);
+        assert_eq!(app.selected, 0); // Closing a folder keeps the current diff open.
+        app.apply_snapshot(Snapshot::from_patch(diff::DEMO));
+        assert!(app.collapsed.contains("src"));
+        assert_eq!(app.tree.len(), 2);
+        app.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert!(!app.collapsed.contains("src"));
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.collapsed.contains("src"));
+        app.open_picker();
+        app.picker = Some("greeting".into());
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.collapsed.contains("src"));
+        assert_eq!(app.tree[app.tree_cursor].file, Some(0));
+        app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.tree[app.tree_cursor].path, "src");
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.collapsed.contains("src"));
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.files[app.selected].name, "README.md");
+    }
+
+    #[test]
+    fn dragging_border_and_scrollbar_and_wheel_keep_diff_selection() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let patch = (0..50).map(|i| format!(
+            "diff --git a/src/file{i:02}.rs b/src/file{i:02}.rs\n--- a/src/file{i:02}.rs\n+++ b/src/file{i:02}.rs\n@@ -1 +1 @@\n-old\n+new\n"
+        )).collect::<String>();
+        let mut app = App::new(Options::default(), Snapshot::from_patch(&patch));
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let mut mouse = event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.sidebar_edge.x,
+            row: app.sidebar_edge.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.mouse(mouse);
+        mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+        mouse.column = 39;
+        app.mouse(mouse);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.list_area.width, 38);
+        mouse.kind = MouseEventKind::Up(MouseButton::Left);
+        app.mouse(mouse);
+        assert!(app.drag.is_none());
+        mouse.column = app.scrollbar.x;
+        mouse.row = app.scrollbar.y;
+        mouse.kind = MouseEventKind::Down(MouseButton::Left);
+        app.mouse(mouse);
+        mouse.kind = MouseEventKind::Drag(MouseButton::Left);
+        mouse.row = 100; // Dragging outside the pane clamps at the end.
+        app.mouse(mouse);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(
+            app.file_state.offset(),
+            app.tree.len() - usize::from(app.list_area.height)
+        );
+        assert_eq!(app.selected, 0);
+        mouse.kind = MouseEventKind::Up(MouseButton::Left);
+        app.mouse(mouse);
+        mouse.kind = MouseEventKind::ScrollUp;
+        mouse.row = app.list_area.y;
+        mouse.column = app.list_area.x;
+        let offset = app.file_state.offset();
+        app.mouse(mouse);
+        assert_eq!(app.file_state.offset(), offset - 3);
+        assert_eq!(app.selected, 0);
+        mouse.kind = MouseEventKind::Down(MouseButton::Left);
+        let expected = app.tree[app.file_state.offset()].file.unwrap();
+        app.mouse(mouse);
+        assert_eq!(app.selected, expected);
+        app.collapsed.insert("src".into());
+        app.rebuild_tree();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.file_state.offset(), 0);
+        assert_eq!(app.scrollbar.height, 0);
+        terminal.backend_mut().resize(10, 3);
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert_eq!(app.sidebar_edge.width, 0);
+    }
+
     #[test]
     fn render_small_and_normal_terminals() {
         use ratatui::{backend::TestBackend, Terminal};

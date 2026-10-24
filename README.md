@@ -138,7 +138,10 @@ Checks have a five-second network timeout and never block scrolling or quitting.
 | Scroll horizontally | Left/Right, h/l | Horizontal wheel or Shift+wheel |
 | Switch focus | Tab, Enter to focus diff | Click file list or diff |
 | Inspect previous code | Enter on a marked line; Esc closes | Click a changed line; click popup to close |
-| Previous/next file | `[` / `]` | Click a file; wheel over file list |
+| Previous/next file | `[` / `]` | Click a file |
+| Collapse/expand folder | Left/Right or Enter with file list focused | Click a folder |
+| Scroll file list | Up/Down with file list focused | Wheel or drag its scrollbar |
+| Resize file list | | Drag its right border |
 | Previous/next hunk | p / n | |
 | Start/end of file | Home/End, g/G | |
 | Current/unified/split view | v | Click view in top bar |
@@ -149,6 +152,10 @@ Checks have a five-second network timeout and never block scrolling or quitting.
 | Refresh | r | |
 | Help | ? | |
 | Quit | q, Esc, Ctrl+C | |
+
+The file sidebar groups changed files into collapsible directories, with directories first and names sorted alphabetically. Folder state and sidebar width are retained during refresh. Closing a folder keeps the current diff open; choosing a file with the picker or `[` / `]` reveals its parent folders. The wheel scrolls the file list without switching the current diff. The sidebar scrollbar appears when the list exceeds the available height. Drag the sidebar’s right border to resize it.
+
+Touch input depends on the terminal: taps and drags work when it forwards them as mouse clicks and drags. Native touch gestures are not handled directly, and physical touchscreen behavior has not been verified.
 
 The file picker filters by a case-insensitive substring of the path. Double-click means two clicks on the same file within 400 ms. Double-Shift means two standalone Shift presses within 400 ms; it requires a terminal that reports modifier keys through the Kitty keyboard protocol. Ctrl+P and `/` are the portable alternatives.
 

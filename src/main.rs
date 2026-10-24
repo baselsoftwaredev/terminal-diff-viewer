@@ -1,5 +1,6 @@
 mod config;
 mod diff;
+mod file_tree;
 mod highlight;
 mod refresh;
 mod setup;

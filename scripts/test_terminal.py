@@ -140,6 +140,32 @@ def main():
             wait_for('These lines are new.')
             send(b'\x1b')
             wait_for('Previous code', present=False)
+            # Exercise actual SGR mouse input through Crossterm, including drag capture.
+            nested = root / 'src'
+            nested.mkdir()
+            for i in range(36):
+                (nested / f'a{i:02}.rs').write_text(f'nested file {i}\n')
+            wait_for('▾ src/')
+            def mouse(button, col, row, release=False):
+                send(f'\x1b[<{button};{col};{row}{"m" if release else "M"}'.encode())
+            mouse(0, 3, 3)
+            mouse(0, 3, 3, release=True)
+            wait_for('▸ src/')
+            wait_for('new a00.rs', present=False)
+            mouse(0, 3, 3)
+            mouse(0, 3, 3, release=True)
+            wait_for('new a00.rs')
+            mouse(0, 30, 5)  # Right border of the default 30-column sidebar.
+            mouse(32, 45, 5)
+            mouse(0, 45, 5, release=True)
+            # Resizing leaves room for a longer filename, then drag the scrollbar.
+            (nested / 'a00_long_filename_for_resize.rs').write_text('wide sidebar\n')
+            wait_for('a00_long_filename_for_resize.rs')
+            mouse(0, 44, 3)
+            mouse(32, 44, 24)
+            mouse(0, 44, 24, release=True)
+            wait_for('new a35.rs')
+            wait_for('brand_new_code')  # Scrolling the tree did not switch files.
             send(b's')
             wait_for('No changes in this view.')
             git('add', 'extra.rs')
@@ -155,7 +181,7 @@ def main():
             send(b'q')
             proc.wait(timeout=3)
             assert proc.returncode == 0
-            print('PASS: full current file, previous-code popup, repeated live edits, new files, staging, and all three views.')
+            print('PASS: full current file, previous-code popup, repeated live edits, new files, staging, all three views, folder clicks, sidebar resizing, and scrollbar dragging.')
         finally:
             if proc.poll() is None:
                 proc.kill()
