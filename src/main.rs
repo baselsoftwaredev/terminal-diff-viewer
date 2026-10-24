@@ -1,0 +1,140 @@
+mod config;
+mod diff;
+mod highlight;
+mod ui;
+
+use std::{
+    env,
+    io::{self, IsTerminal},
+    path::PathBuf,
+};
+
+#[derive(Default)]
+struct Options {
+    repo: PathBuf,
+    staged: bool,
+    base: Option<String>,
+    paths: Vec<String>,
+    demo: bool,
+    plain: bool,
+    no_mouse: bool,
+    config: Option<PathBuf>,
+    no_syntax: bool,
+    syntax_languages: Vec<String>,
+}
+
+const HELP: &str = "tdv — terminal Git diff viewer
+
+Usage: tdv [OPTIONS] [-- PATH...]
+
+  --repo DIRECTORY   Repository to view (default: current directory)
+  --staged           Show staged changes instead of unstaged changes
+  --base REVISION    Compare against a revision (e.g. HEAD or main)
+  --demo             Explore sample changes without a repository
+  --plain            Print the patch without an interactive interface
+  --no-mouse         Keep the terminal's normal mouse selection behavior
+  --config FILE      Use a config file instead of the repository's .tdv.toml
+  --no-syntax        Disable syntax highlighting, overriding the config
+  -h, --help         Show this help
+  -V, --version      Show version
+
+Keys: arrows / hjkl navigate, Tab focus, [ / ] files, n / p hunks,
+      v split/unified, f sidebar, / or Ctrl+P file picker, r refresh,
+      s staged/unstaged, ? help, q quit. Double-click a file to expand.
+      Double-Shift opens the picker on terminals with enhanced key reporting.
+
+Requires Git for repository diffs. Untracked files are not included.
+Syntax highlighting is off by default. Enable languages in .tdv.toml:
+  [syntax]
+  languages = [\"csharp\", \"cpp\", \"rust\"]
+";
+
+fn options() -> io::Result<Option<Options>> {
+    let mut opts = Options {
+        repo: env::current_dir()?,
+        ..Options::default()
+    };
+    let mut args = env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{HELP}");
+                return Ok(None);
+            }
+            "-V" | "--version" => {
+                println!("tdv {}", env!("CARGO_PKG_VERSION"));
+                return Ok(None);
+            }
+            "--repo" => {
+                opts.repo = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| io::Error::other("--repo requires a directory"))?,
+                )
+            }
+            "--base" => {
+                opts.base = Some(
+                    args.next()
+                        .ok_or_else(|| io::Error::other("--base requires a revision"))?,
+                )
+            }
+            "--staged" => opts.staged = true,
+            "--demo" => opts.demo = true,
+            "--plain" => opts.plain = true,
+            "--no-mouse" => opts.no_mouse = true,
+            "--no-syntax" => opts.no_syntax = true,
+            "--config" => {
+                opts.config =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        io::Error::other("--config requires a file path")
+                    })?))
+            }
+            "--" => {
+                opts.paths.extend(args);
+                break;
+            }
+            _ => {
+                return Err(io::Error::other(format!(
+                    "unknown argument: {arg}; see tdv --help"
+                )))
+            }
+        }
+    }
+    Ok(Some(opts))
+}
+
+impl Options {
+    fn patch(&self) -> io::Result<String> {
+        if self.demo {
+            Ok(diff::DEMO.to_owned())
+        } else {
+            diff::load(&self.repo, self.staged, self.base.as_deref(), &self.paths)
+        }
+    }
+}
+
+fn run() -> io::Result<()> {
+    let Some(mut opts) = options()? else {
+        return Ok(());
+    };
+    let patch = opts.patch()?;
+    if opts.plain || !io::stdout().is_terminal() {
+        print!("{patch}");
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() || env::var("TERM").is_ok_and(|v| v == "dumb") {
+        return Err(io::Error::other(
+            "interactive mode needs a terminal; use --plain",
+        ));
+    }
+    if !opts.no_syntax {
+        opts.syntax_languages = config::load(&opts.repo, opts.config.as_deref())?;
+    }
+    ui::run(opts, patch)
+}
+
+fn main() {
+    if let Err(err) = run() {
+        eprintln!("tdv: {err}");
+        std::process::exit(1);
+    }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "terminal-diff-viewer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "A portable, mouse-friendly terminal Git diff viewer"
+license = "MIT"
+repository = "https://github.com/baselsoftwaredev/terminal-diff-viewer"
+
+[[bin]]
+name = "tdv"
+path = "src/main.rs"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+
+[profile.release]
+lto = "thin"
+strip = true

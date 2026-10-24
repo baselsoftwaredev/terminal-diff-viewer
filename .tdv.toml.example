@@ -1,0 +1,4 @@
+# Copy to .tdv.toml at the root of each repository to opt in.
+# With no config, or an empty languages array, syntax highlighting is off.
+[syntax]
+languages = ["csharp", "cpp", "rust"]
