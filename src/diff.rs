@@ -202,6 +202,7 @@ impl FileDiff {
             .iter()
             .find(|change| change.start <= line && line < change.end)
     }
+    #[cfg(test)]
     pub fn counts(&self) -> (usize, usize) {
         (
             self.lines.iter().filter(|l| l.kind == Kind::Added).count(),

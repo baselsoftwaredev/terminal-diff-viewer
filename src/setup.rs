@@ -23,7 +23,7 @@ pub struct Setup {
     pub replace: bool,
     pub error: Option<String>,
     selected: usize,
-    rows: [Rect; 4],
+    rows: [Rect; 5],
     save: Rect,
     skip: Rect,
 }
@@ -36,13 +36,15 @@ impl Setup {
             replace,
             error: None,
             selected: 0,
-            rows: [Rect::default(); 4],
+            rows: [Rect::default(); 5],
             save: Rect::default(),
             skip: Rect::default(),
         }
     }
     fn toggle(&mut self, index: usize) {
-        if index == 3 {
+        if index == 4 {
+            self.config.ui.icons = !self.config.ui.icons;
+        } else if index == 3 {
             self.config.updates.check_on_startup = !self.config.updates.check_on_startup;
         } else {
             let language = LANGUAGES[index].1;
@@ -65,10 +67,10 @@ impl Setup {
         }
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.selected = self.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(3),
-            KeyCode::Tab => self.selected = (self.selected + 1) % 4,
+            KeyCode::Down | KeyCode::Char('j') => self.selected = (self.selected + 1).min(4),
+            KeyCode::Tab => self.selected = (self.selected + 1) % 5,
             KeyCode::Char(' ') if key.kind == KeyEventKind::Press => self.toggle(self.selected),
-            KeyCode::Char('1'..='4') if key.kind == KeyEventKind::Press => {
+            KeyCode::Char('1'..='5') if key.kind == KeyEventKind::Press => {
                 if let KeyCode::Char(c) = key.code {
                     self.toggle(c as usize - '1' as usize);
                 }
@@ -100,12 +102,12 @@ impl Setup {
         Action::None
     }
     pub fn draw(&mut self, frame: &mut Frame) {
-        self.rows = [Rect::default(); 4];
+        self.rows = [Rect::default(); 5];
         self.save = Rect::default();
         self.skip = Rect::default();
         let area = frame.area();
         let width = area.width.saturating_sub(2).min(78);
-        let height = area.height.saturating_sub(2).min(19);
+        let height = area.height.saturating_sub(2).min(20);
         let popup = Rect::new(
             area.x + (area.width - width) / 2,
             area.y + (area.height - height) / 2,
@@ -120,9 +122,9 @@ impl Setup {
         );
         let inner = block.inner(popup);
         frame.render_widget(block, popup);
-        if inner.height < 14 || inner.width < 45 {
+        if inner.height < 15 || inner.width < 45 {
             frame.render_widget(
-                Paragraph::new("Resize to at least 49 × 18 to configure.\nEsc skips; q quits."),
+                Paragraph::new("Resize to at least 49 × 19 to configure.\nEsc skips; q quits."),
                 inner,
             );
             return;
@@ -135,10 +137,15 @@ impl Setup {
         for (i, (label, language)) in LANGUAGES
             .iter()
             .copied()
-            .chain(std::iter::once(("Check for updates at startup", "")))
+            .chain([
+                ("Check for updates at startup", ""),
+                ("File icons (requires Nerd Font v3+)", ""),
+            ])
             .enumerate()
         {
-            let checked = if language.is_empty() {
+            let checked = if i == 4 {
+                self.config.ui.icons
+            } else if language.is_empty() {
                 self.config.updates.check_on_startup
             } else {
                 self.config.syntax.languages.iter().any(|s| s == language)
@@ -170,13 +177,13 @@ impl Setup {
                 Span::styled("[Enter / s] Save", Style::default().fg(Color::Cyan)),
                 Span::raw("   [Esc] Skip   [q] Quit"),
             ]),
-            Line::raw("↑↓ / Tab select · Space or 1–4 toggle"),
+            Line::raw("↑↓ / Tab select · Space or 1–5 toggle"),
         ]);
-        self.save = Rect::new(inner.x, inner.y + 12, 16, 1);
-        self.skip = Rect::new(inner.x + 19, inner.y + 12, 10, 1);
+        self.save = Rect::new(inner.x, inner.y + 13, 16, 1);
+        self.skip = Rect::new(inner.x + 19, inner.y + 13, 10, 1);
         frame.render_widget(Paragraph::new(lines), inner);
         if let Some(error) = &self.error {
-            let area = Rect::new(inner.x, inner.y + 8, inner.width, 3);
+            let area = Rect::new(inner.x, inner.y + 9, inner.width, 3);
             frame.render_widget(Clear, area);
             frame.render_widget(
                 Paragraph::new(error.clone())
@@ -217,11 +224,12 @@ mod tests {
         let (_root, mut setup) = wizard();
         assert!(setup.config.syntax.languages.is_empty());
         setup.config.syntax.languages.push("python".into());
-        for c in ['1', '3', '4'] {
+        for c in ['1', '3', '4', '5'] {
             setup.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
         }
         assert_eq!(setup.config.syntax.languages, ["python", "c#", "rust"]);
         assert!(!setup.config.updates.check_on_startup);
+        assert!(setup.config.ui.icons);
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| setup.draw(frame)).unwrap();
         assert!(matches!(
@@ -233,7 +241,7 @@ mod tests {
     #[test]
     fn mouse_controls_and_small_terminal_rendering() {
         let (_root, mut setup) = wizard();
-        for (width, height) in [(10, 3), (30, 6), (49, 18), (80, 24)] {
+        for (width, height) in [(10, 3), (30, 6), (49, 19), (80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal.draw(|frame| setup.draw(frame)).unwrap();
             if width < 49 {

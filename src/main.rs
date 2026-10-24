@@ -22,6 +22,8 @@ struct Options {
     demo: bool,
     plain: bool,
     no_mouse: bool,
+    icons: bool,
+    icon_override: Option<bool>,
     config: Option<PathBuf>,
     no_syntax: bool,
     syntax_languages: Vec<String>,
@@ -45,6 +47,8 @@ Usage: tdv [OPTIONS] [-- PATH...]
   --demo             Explore sample changes without a repository
   --plain            Print the patch without an interactive interface
   --no-mouse         Keep the terminal's normal mouse selection behavior
+  --icons            Show file-type icons (requires a Nerd Font v3+)
+  --no-icons         Hide icons, overriding the config
   --config FILE      Use a config file instead of the repository's .tdv.toml
   --no-syntax        Disable syntax highlighting, overriding the config
   --no-update-check  Skip the background check for newer releases
@@ -56,7 +60,7 @@ Usage: tdv [OPTIONS] [-- PATH...]
 
 Keys: arrows / hjkl navigate, Tab focus, [ / ] files, n / p hunks,
       v current/unified/split, Enter previous code, f sidebar, / or Ctrl+P picker,
-      r refresh,
+      r refresh, Shift+R reload config,
       s staged/unstaged, ? help, q quit. Double-click a file to expand.
       Double-Shift opens the picker on terminals with enhanced key reporting.
 
@@ -98,6 +102,8 @@ fn options() -> io::Result<Option<Options>> {
             "--demo" => opts.demo = true,
             "--plain" => opts.plain = true,
             "--no-mouse" => opts.no_mouse = true,
+            "--icons" => opts.icon_override = Some(true),
+            "--no-icons" => opts.icon_override = Some(false),
             "--no-syntax" => opts.no_syntax = true,
             "--no-update-check" => opts.no_update_check = true,
             "--no-auto-refresh" => opts.no_auto_refresh = true,
@@ -167,6 +173,7 @@ fn run() -> io::Result<()> {
     if !opts.no_syntax {
         opts.syntax_languages = config.syntax.languages;
     }
+    opts.icons = opts.icon_override.unwrap_or(config.ui.icons);
     opts.check_updates = !opts.no_update_check && config.updates.check_on_startup;
     opts.auto_refresh = !opts.no_auto_refresh && config.refresh.auto && !opts.demo;
     let snapshot = opts.snapshot()?;

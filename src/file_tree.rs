@@ -59,6 +59,44 @@ pub fn rows<'a>(paths: impl Iterator<Item = &'a str>, collapsed: &HashSet<String
     rows
 }
 
+// Nerd Fonts v3 Material Design codepoints, from the upstream glyphnames.json.
+// These are font glyphs, so no image loading or icon dependency is needed.
+pub fn icon(name: &str) -> &'static str {
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with(".git") {
+        return "\u{f02a2}";
+    }
+    if matches!(lower.as_str(), "dockerfile" | "makefile" | "justfile") {
+        return "\u{f018d}";
+    }
+    match lower.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("") {
+        "rs" => "\u{f1617}",
+        "cs" | "csx" => "\u{f031b}",
+        "c" | "h" => "\u{f0671}",
+        "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "hh" => "\u{f0672}",
+        "py" | "pyi" => "\u{f0320}",
+        "js" | "mjs" | "cjs" => "\u{f031e}",
+        "ts" | "mts" | "cts" => "\u{f06e6}",
+        "jsx" | "tsx" => "\u{f0708}",
+        "go" => "\u{f07d3}",
+        "java" => "\u{f0b37}",
+        "rb" => "\u{f0d2d}",
+        "php" => "\u{f031f}",
+        "swift" => "\u{f06e5}",
+        "kt" | "kts" => "\u{f1219}",
+        "html" | "htm" => "\u{f031d}",
+        "css" | "scss" | "sass" | "less" => "\u{f031c}",
+        "json" | "jsonc" | "jsonl" => "\u{f0626}",
+        "toml" | "yaml" | "yml" | "ini" | "cfg" | "conf" => "\u{f08bb}",
+        "sh" | "bash" | "zsh" | "fish" | "ps1" | "bat" | "cmd" => "\u{f018d}",
+        "md" | "mdx" | "markdown" => "\u{f0354}",
+        "txt" | "rst" => "\u{f09ee}",
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" => "\u{f0eb0}",
+        "pdf" => "\u{f0226}",
+        _ => "\u{f0224}",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

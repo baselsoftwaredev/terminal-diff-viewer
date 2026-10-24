@@ -90,6 +90,10 @@ def main():
         def git(*args):
             subprocess.run(['git', *args], cwd=root, check=True, stdout=subprocess.DEVNULL)
         git('init', '--quiet')
+        config = root / '.tdv.toml'
+        config.write_text('[updates]\ncheck_on_startup = false\n')
+        with (root / '.git' / 'info' / 'exclude').open('a') as excluded:
+            excluded.write('\n/.tdv.toml\n')
         original = ''.join('unchanged line %s\n' % n for n in range(1, 41))
         code = root / 'code.rs'
         code.write_text(original)
@@ -133,7 +137,7 @@ def main():
             wait_for('CURRENT VERSION C')
             added = root / 'extra.rs'
             added.write_text('brand_new_code\nsecond line\n')
-            wait_for('new extra.rs')
+            wait_for('extra.rs')
             send(b'\x10extra\r')
             wait_for('brand_new_code')
             send(b'\r')
@@ -151,10 +155,10 @@ def main():
             mouse(0, 3, 3)
             mouse(0, 3, 3, release=True)
             wait_for('▸ src/')
-            wait_for('new a00.rs', present=False)
+            wait_for('a00.rs', present=False)
             mouse(0, 3, 3)
             mouse(0, 3, 3, release=True)
-            wait_for('new a00.rs')
+            wait_for('a00.rs')
             mouse(0, 30, 5)  # Right border of the default 30-column sidebar.
             mouse(32, 45, 5)
             mouse(0, 45, 5, release=True)
@@ -164,8 +168,15 @@ def main():
             mouse(0, 44, 3)
             mouse(32, 44, 24)
             mouse(0, 44, 24, release=True)
-            wait_for('new a35.rs')
+            wait_for('a35.rs')
             wait_for('brand_new_code')  # Scrolling the tree did not switch files.
+            config.write_text('[ui]\nicons = true\n')
+            send(b'R')
+            wait_for('Reloaded configuration.')
+            wait_for('\U000f1617 a35.rs')
+            config.write_text('[ui]\nicons = false\n')
+            send(b'R')
+            wait_for('\U000f1617 a35.rs', present=False)
             send(b's')
             wait_for('No changes in this view.')
             git('add', 'extra.rs')
@@ -181,7 +192,7 @@ def main():
             send(b'q')
             proc.wait(timeout=3)
             assert proc.returncode == 0
-            print('PASS: full current file, previous-code popup, repeated live edits, new files, staging, all three views, folder clicks, sidebar resizing, and scrollbar dragging.')
+            print('PASS: full current file, previous-code popup, repeated live edits, new files, staging, all three views, folder clicks, sidebar resizing, scrollbar dragging, and live configuration reload.')
         finally:
             if proc.poll() is None:
                 proc.kill()

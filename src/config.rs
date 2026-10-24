@@ -12,6 +12,13 @@ pub struct Config {
     pub syntax: Syntax,
     pub updates: Updates,
     pub refresh: Refresh,
+    pub ui: Ui,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Ui {
+    pub icons: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

@@ -69,7 +69,7 @@ Output automatically uses plain text when redirected or piped. A repository with
 
 ## Read the full current file
 
-The default **Current** view shows every line of the selected changed file, including unchanged lines outside Git's patch context. The gutter marks `+` for new lines, `~` for replacement lines, and `-` for a deletion boundary beside a surviving line. Click a marked line, or select it with Up/Down and press Enter, to see previous code in a scrollable popup. Added files are labeled `new`; they show their full contents as additions. Ignored files stay hidden.
+The default **Current** view shows every line of the selected changed file, including unchanged lines outside Git's patch context. The gutter marks `+` for new lines, `~` for replacement lines, and `-` for a deletion boundary beside a surviving line. Click a marked line, or select it with Up/Down and press Enter, to see previous code in a scrollable popup. Added files show their full contents as additions. Ignored files stay hidden.
 
 In unstaged views the current contents come from the working tree, including untracked files. Staged views read the Git index, so unstaged edits do not appear there. Deleted files show a message and let you inspect the previous code. Empty and binary files are listed with a suitable empty state or metadata.
 
@@ -90,7 +90,7 @@ The initial diff still loads before the UI opens. Later Git commands and file re
 
 ## Enable languages per repository
 
-The first interactive launch in a Git repository opens a local setup screen. Choose C#, C++, Rust, and startup update preferences with the mouse or keyboard. Languages start off; startup update checks start on. Press Enter to save, or Esc to skip for this launch. Update checks wait until you finish or skip setup.
+The first interactive launch in a Git repository opens a local setup screen. Choose C#, C++, Rust, file icons, and startup update preferences with the mouse or keyboard. Languages and file icons start off; startup update checks start on. Press Enter to save, or Esc to skip for this launch. Update checks wait until you finish or skip setup.
 
 Saving creates `.tdv.toml` in the repository root and adds a local exclusion in Git's `info/exclude`. The config stays on your machine and is excluded from ordinary `git add` and commits. No shared `.gitignore` edit is needed. Git resolves the exclusion path for linked worktrees too. The app also ensures existing, untracked default config is locally ignored on normal interactive launches.
 
@@ -111,7 +111,7 @@ This enables C# (`.cs`, `.csx`), C++ (including `.cpp` and `.hpp`), and Rust (`.
 
 Names are case-insensitive. `C#`/`cs` and `C++`/`cxx` are also accepted; other bundled languages can be selected using their Syntect grammar names, such as `Python`, `Ruby`, `Go`, `JavaScript`, `JSON`, or `Markdown`. Names that do not match a bundled grammar enable nothing. You can use `shell` for Bash. Files are detected by extension or recognized filename; there is no content-based language guessing.
 
-Config discovery uses the Git repository root, including when launched from a subfolder or with `--repo`. Outside Git (for example in demo mode), it checks the specified directory. Use `--config /path/to/config.toml` to choose a different file and bypass automatic setup and ignore changes; relative explicit paths resolve from the current working directory. `--no-syntax` overrides the config. Setup choices apply immediately after saving. Restart `tdv` after editing config by hand; `r` refreshes the patch, not the config. Plain-text output ignores highlighting configuration entirely.
+Config discovery uses the Git repository root, including when launched from a subfolder or with `--repo`. Outside Git (for example in demo mode), it checks the specified directory. Use `--config /path/to/config.toml` to choose a different file and bypass automatic setup and ignore changes; relative explicit paths resolve from the current working directory. `--no-syntax` overrides the config. Setup choices apply immediately after saving. After editing config by hand, press `Shift+R` to reload icon, syntax, and automatic refresh settings without closing tdv. Startup update preferences take effect on the next launch. `r` refreshes the patch. Invalid config reports an error and keeps the active settings. Command-line overrides such as `--no-icons`, `--no-syntax`, and `--no-auto-refresh` still apply. Plain-text output ignores highlighting configuration entirely.
 
 Grammars remain bundled in the executable. When you opt in, the background worker loads the bundled syntax catalog and only parses files whose language is enabled. Config controls runtime highlighting rather than reducing the executable size or removing catalog entries.
 
@@ -150,10 +150,18 @@ Checks have a five-second network timeout and never block scrolling or quitting.
 | Select in file picker | Up/Down, Enter; Esc closes | |
 | Hide/show file list | f | Double-click a file to hide the list |
 | Refresh | r | |
+| Reload configuration | Shift+R | |
 | Help | ? | |
 | Quit | q, Esc, Ctrl+C | |
 
-The file sidebar groups changed files into collapsible directories, with directories first and names sorted alphabetically. Folder state and sidebar width are retained during refresh. Closing a folder keeps the current diff open; choosing a file with the picker or `[` / `]` reveals its parent folders. The wheel scrolls the file list without switching the current diff. The sidebar scrollbar appears when the list exceeds the available height. Drag the sidebar’s right border to resize it.
+The file sidebar shows only filenames and extensions, without added/deleted line counts or status prefixes. It groups changed files into collapsible directories, with directories first and names sorted alphabetically. Folder state and sidebar width are retained during refresh. Closing a folder keeps the current diff open; choosing a file with the picker or `[` / `]` reveals its parent folders. The wheel scrolls the file list without switching the current diff. The sidebar scrollbar appears when the list exceeds the available height. Drag the sidebar’s right border to resize it.
+
+Optional file-type icons use [Nerd Fonts v3+ Material Design glyphs](https://www.nerdfonts.com/). Select a Nerd Font in your terminal’s font settings, then run `tdv --icons`. Icons are chosen by extension (with a generic file icon for unknown types); filenames and extensions remain visible. No font or image downloads happen in tdv. Without a compatible font, icons may appear as boxes; use `--no-icons` to hide them. Icons are off by default. Run `tdv --setup` to enable the file icons checkbox, or add to your existing `.tdv.toml` and press `Shift+R` in the open viewer:
+
+```toml
+[ui]
+icons = true
+```
 
 Touch input depends on the terminal: taps and drags work when it forwards them as mouse clicks and drags. Native touch gestures are not handled directly, and physical touchscreen behavior has not been verified.
 

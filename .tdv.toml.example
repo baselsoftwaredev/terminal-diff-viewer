@@ -10,3 +10,7 @@ check_on_startup = true
 # Reload Git changes in the background while the viewer is open.
 [refresh]
 auto = true
+
+# Optional file-type icons. Select a Nerd Font v3+ in your terminal first.
+[ui]
+icons = false

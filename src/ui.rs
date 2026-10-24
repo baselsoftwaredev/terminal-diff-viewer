@@ -285,6 +285,32 @@ impl App {
         };
     }
 
+    fn reload_config(&mut self) {
+        match crate::config::load(&self.opts.repo, self.opts.config.as_deref()) {
+            Ok(config) => {
+                self.opts.icons = self.opts.icon_override.unwrap_or(config.ui.icons);
+                let languages = if self.opts.no_syntax {
+                    Vec::new()
+                } else {
+                    config.syntax.languages
+                };
+                if self.opts.syntax_languages != languages {
+                    self.opts.syntax_languages = languages;
+                    self.highlights = Highlighter::new(self.opts.syntax_languages.clone());
+                }
+                let auto = !self.opts.no_auto_refresh && config.refresh.auto && !self.opts.demo;
+                if self.opts.auto_refresh != auto {
+                    self.opts.auto_refresh = auto;
+                    self.pending_snapshot = None;
+                    self.request_refresh();
+                }
+                self.status =
+                    "Reloaded configuration. Startup update preferences apply next launch.".into();
+            }
+            Err(error) => self.status = format!("Config reload failed: {error}"),
+        }
+    }
+
     fn reload(&mut self) {
         self.pending_snapshot = None;
         self.manual_refresh = true;
@@ -492,6 +518,7 @@ impl App {
                         } else {
                             setup.config.syntax.languages.clone()
                         };
+                        self.opts.icons = self.opts.icon_override.unwrap_or(setup.config.ui.icons);
                         self.opts.check_updates =
                             !self.opts.no_update_check && setup.config.updates.check_on_startup;
                         self.opts.auto_refresh = !self.opts.no_auto_refresh
@@ -643,6 +670,7 @@ impl App {
                 self.reload();
             }
             KeyCode::Char('r') => self.reload(),
+            KeyCode::Char('R') => self.reload_config(),
             KeyCode::Char(']') => self.select(self.selected.saturating_add(1)),
             KeyCode::Char('[') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Char('n') => self.hunk(true),
@@ -940,14 +968,13 @@ impl App {
                 .take(usize::from(self.list_area.height))
                 .map(|(index, row)| {
                     let indent = "  ".repeat(row.depth);
-                    let label = if let Some(file) = row.file {
-                        let f = &self.files[file];
-                        let (a, d) = f.counts();
-                        format!(
-                            "{indent}{}{} +{a} -{d}",
-                            if f.is_new { "new " } else { "" },
-                            safe_name(&row.label)
-                        )
+                    let label = if row.file.is_some() {
+                        let name = safe_name(&row.label);
+                        if self.opts.icons {
+                            format!("{indent}{} {name}", file_tree::icon(&row.label))
+                        } else {
+                            format!("{indent}{name}")
+                        }
                     } else {
                         format!(
                             "{indent}{} {}/",
@@ -1174,7 +1201,7 @@ impl App {
         } else if self.help {
             let popup = centered(area, 74, 22);
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new("Mouse\n  Click folders to collapse; click files to select\n  Drag the file pane border to resize; drag its scrollbar to scroll\n  Click changed lines for previous code; wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan code / collapse or expand folders\n  Tab / Enter    Switch focus / inspect previous code\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Cycle current/unified/split / sidebar\n  s / r          Toggle staged changes / refresh\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
+            frame.render_widget(Paragraph::new("Mouse\n  Click folders to collapse; click files to select\n  Drag the file pane border to resize; drag its scrollbar to scroll\n  Click changed lines for previous code; wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan code / collapse or expand folders\n  Tab / Enter    Switch focus / inspect previous code\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Cycle current/unified/split / sidebar\n  s / r          Toggle staged changes / refresh\n  Shift+R        Reload config without restarting\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
                 .block(Block::bordered().title(" Shortcuts ")).style(Style::default().bg(BG).fg(FG)), popup);
         } else if let Some(query) = &self.picker {
             let popup = centered(area, 70, 18);
@@ -1584,6 +1611,49 @@ mod tests {
         terminal.backend_mut().resize(10, 3);
         terminal.draw(|frame| app.draw(frame)).unwrap();
         assert_eq!(app.sidebar_edge.width, 0);
+    }
+
+    #[test]
+    fn config_reload_applies_live_and_retains_settings_on_error() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config.toml");
+        // Existing configuration needs no migration and defaults to no icons.
+        std::fs::write(&path, "[syntax]\nlanguages = []\n[refresh]\nauto = false\n").unwrap();
+        let mut app = App::new(
+            Options {
+                config: Some(path.clone()),
+                ..Options::default()
+            },
+            Snapshot::from_patch(diff::DEMO),
+        );
+        app.key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(!app.opts.icons);
+        std::fs::write(
+            &path,
+            "[ui]\nicons = true\n[syntax]\nlanguages = [\"rust\"]\n[refresh]\nauto = false\n",
+        )
+        .unwrap();
+        app.key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT));
+        assert!(app.opts.icons);
+        assert_eq!(app.opts.syntax_languages, ["rust"]);
+        assert!(app.status.starts_with("Reloaded configuration"));
+        std::fs::write(&path, "[ui]\nicons = invalid\n").unwrap();
+        app.reload_config();
+        assert!(app.status.starts_with("Config reload failed:"));
+        assert!(app.opts.icons);
+        assert_eq!(app.opts.syntax_languages, ["rust"]);
+        app.opts.icon_override = Some(false);
+        app.opts.no_syntax = true;
+        app.opts.no_auto_refresh = true;
+        std::fs::write(
+            &path,
+            "[ui]\nicons = true\n[syntax]\nlanguages = [\"rust\"]\n",
+        )
+        .unwrap();
+        app.reload_config();
+        assert!(!app.opts.icons);
+        assert!(app.opts.syntax_languages.is_empty());
+        assert!(!app.opts.auto_refresh);
     }
 
     #[test]
