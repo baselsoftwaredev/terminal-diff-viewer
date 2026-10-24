@@ -68,7 +68,7 @@ Output automatically uses plain text when redirected or piped. A repository with
 
 ## Enable languages per repository
 
-Syntax highlighting is **off by default for every language**. With no config, the viewer starts no highlighting thread, loads no syntax definitions or themes, and waits for input without background polling. Added/removed diff colors always remain available.
+Syntax highlighting is **off by default for every language**. With no config, the viewer starts no highlighting thread and loads no syntax definitions or themes. Added/removed diff colors always remain available.
 
 Create `.tdv.toml` at the root of a repository to opt in to the languages you want:
 
@@ -84,6 +84,21 @@ Names are case-insensitive. `C#`/`cs` and `C++`/`cxx` are also accepted; other b
 Config discovery uses the Git repository root, including when launched from a subfolder or with `--repo`. Outside Git (for example in demo mode), it checks the specified directory. Use `--config /path/to/config.toml` to choose a different file; relative explicit paths resolve from the current working directory. `--no-syntax` overrides the config. Restart `tdv` after changing config; `r` refreshes the patch, not the config. Plain-text output ignores highlighting configuration entirely.
 
 Grammars remain bundled in the executable. When you opt in, the background worker loads the bundled syntax catalog and only parses files whose language is enabled. Config controls runtime highlighting rather than reducing the executable size or removing catalog entries.
+
+## Startup updates
+
+On each interactive launch, `tdv` checks GitHub for a newer stable release in the background, after painting the diff. If one is available for your platform, a prompt asks whether to install it. Press `y` to download, verify the release checksum, and replace the current executable. Press `n`, Esc, or Enter to decline; updates are never installed automatically. You can keep browsing during installation. Once it finishes, restart `tdv` to use the new version.
+
+Offline connections, timeouts, rate limits, or unavailable releases silently skip the check. Download or install failures show a status message. The update requires write access to the installed executable's directory and never asks for sudo. Plain-text output, `--help`, and `--version` do not check for updates. Checks use GitHub's public API with no login or token.
+
+To disable checks for one launch, use `tdv --no-update-check`. To disable them for a repository, add:
+
+```toml
+[updates]
+check_on_startup = false
+```
+
+Checks have a five-second network timeout and never block scrolling or quitting. The update prompt waits until a file picker or help panel is closed.
 
 ## Controls
 
@@ -126,7 +141,7 @@ sh -n install.sh
 python3 scripts/test_install.py
 ```
 
-Automated tests cover parsing, line alignment, navigation, rendering at several terminal sizes, config discovery and defaults, language selection, and CLI behavior against a temporary Git repository. Cross-platform support comes from the terminal backend; native validation on other operating systems is still needed.
+Automated tests cover parsing, line alignment, navigation, rendering at several terminal sizes, config discovery and defaults, language selection, update consent and checksum validation, and CLI behavior against a temporary Git repository. CI runs native tests and binary smoke checks on all five release platforms. Interactive terminal behavior is tested locally on macOS; other terminal environments may vary.
 
 ## Builds and releases
 
@@ -135,8 +150,8 @@ GitHub Actions runs formatting, lint, installer tests, and native Rust tests, th
 To publish a version, first update `Cargo.toml` and run `cargo check` to update `Cargo.lock`, commit those changes, then create and push the matching tag:
 
 ```sh
-git tag v0.1.0
-git push origin main v0.1.0
+git tag v0.2.0
+git push origin main v0.2.0
 ```
 
 The tag must match the package version. The pipeline uploads all five archives, `SHA256SUMS`, and `install.sh` to a draft release before publishing it. A failed build leaves no new public release. A rerun can complete a draft, but refuses to overwrite an already published release. The workflow uses GitHub's built-in token; no publishing secret is needed.

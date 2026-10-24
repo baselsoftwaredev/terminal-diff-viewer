@@ -5,16 +5,30 @@ use std::{
     process::Command,
 };
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct Config {
-    syntax: Syntax,
+pub struct Config {
+    pub syntax: Syntax,
+    pub updates: Updates,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-struct Syntax {
-    languages: Vec<String>,
+pub struct Syntax {
+    pub languages: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Updates {
+    pub check_on_startup: bool,
+}
+impl Default for Updates {
+    fn default() -> Self {
+        Self {
+            check_on_startup: true,
+        }
+    }
 }
 
 pub fn language_name(name: &str) -> String {
@@ -28,14 +42,16 @@ pub fn language_name(name: &str) -> String {
     }
 }
 
-fn parse(text: &str) -> io::Result<Vec<String>> {
-    let config: Config = toml::from_str(text).map_err(|err| io::Error::other(err.to_string()))?;
-    Ok(config
+fn parse(text: &str) -> io::Result<Config> {
+    let mut config: Config =
+        toml::from_str(text).map_err(|err| io::Error::other(err.to_string()))?;
+    config.syntax.languages = config
         .syntax
         .languages
         .iter()
         .map(|name| language_name(name))
-        .collect())
+        .collect();
+    Ok(config)
 }
 
 pub fn default_path(repo: &Path) -> PathBuf {
@@ -51,14 +67,14 @@ pub fn default_path(repo: &Path) -> PathBuf {
     root.as_deref().unwrap_or(repo).join(".tdv.toml")
 }
 
-pub fn load(repo: &Path, explicit: Option<&Path>) -> io::Result<Vec<String>> {
+pub fn load(repo: &Path, explicit: Option<&Path>) -> io::Result<Config> {
     let path = explicit
         .map(Path::to_path_buf)
         .unwrap_or_else(|| default_path(repo));
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) if explicit.is_none() && err.kind() == io::ErrorKind::NotFound => {
-            return Ok(Vec::new())
+            return Ok(Config::default())
         }
         Err(err) => return Err(io::Error::other(format!("{}: {err}", path.display()))),
     };
@@ -70,11 +86,18 @@ mod tests {
     use super::*;
     #[test]
     fn default_off_and_language_aliases() {
-        assert!(parse("").unwrap().is_empty());
-        assert!(parse("[syntax]").unwrap().is_empty());
-        assert!(parse("[syntax]\nlanguages = []").unwrap().is_empty());
+        assert!(parse("").unwrap().syntax.languages.is_empty());
+        assert!(parse("[syntax]").unwrap().syntax.languages.is_empty());
+        assert!(parse("[syntax]\nlanguages = []")
+            .unwrap()
+            .syntax
+            .languages
+            .is_empty());
         assert_eq!(
-            parse("[syntax]\nlanguages = ['C#', 'cpp', 'Rust']").unwrap(),
+            parse("[syntax]\nlanguages = ['C#', 'cpp', 'Rust']")
+                .unwrap()
+                .syntax
+                .languages,
             ["c#", "c++", "rust"]
         );
         assert_eq!(language_name("csharp"), "c#");
@@ -85,6 +108,17 @@ mod tests {
         assert!(parse("[syntax]\nlanguages = true").is_err());
         assert!(parse("[syntax]\nlanguage = ['rust']").is_err());
         assert!(parse("[syntx]").is_err());
+    }
+    #[test]
+    fn startup_checks_are_enabled_unless_explicitly_disabled() {
+        assert!(parse("").unwrap().updates.check_on_startup);
+        assert!(
+            !parse("[updates]\ncheck_on_startup = false")
+                .unwrap()
+                .updates
+                .check_on_startup
+        );
+        assert!(parse("[updates]\ncheck_on_startup = 'false'").is_err());
     }
     #[test]
     fn root_config_is_found_from_nested_directory_and_explicit_config_wins() {
@@ -112,12 +146,15 @@ mod tests {
             .success());
         let nested = path.join("src/nested");
         fs::create_dir_all(&nested).unwrap();
-        assert!(load(&nested, None).unwrap().is_empty());
+        assert!(load(&nested, None).unwrap().syntax.languages.is_empty());
         fs::write(path.join(".tdv.toml"), "[syntax]\nlanguages = ['rust']").unwrap();
-        assert_eq!(load(&nested, None).unwrap(), ["rust"]);
+        assert_eq!(load(&nested, None).unwrap().syntax.languages, ["rust"]);
         let custom = path.join("custom.toml");
         fs::write(&custom, "[syntax]\nlanguages = ['cpp', 'csharp']").unwrap();
-        assert_eq!(load(&nested, Some(&custom)).unwrap(), ["c++", "c#"]);
+        assert_eq!(
+            load(&nested, Some(&custom)).unwrap().syntax.languages,
+            ["c++", "c#"]
+        );
         assert!(load(&nested, Some(&path.join("missing.toml"))).is_err());
         fs::write(&custom, "broken = [").unwrap();
         assert!(load(&nested, Some(&custom))

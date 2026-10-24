@@ -2,3 +2,7 @@
 # With no config, or an empty languages array, syntax highlighting is off.
 [syntax]
 languages = ["csharp", "cpp", "rust"]
+
+# Startup update checks are enabled by default. Set false to opt out.
+[updates]
+check_on_startup = true

@@ -2,6 +2,7 @@ mod config;
 mod diff;
 mod highlight;
 mod ui;
+mod update;
 
 use std::{
     env,
@@ -21,6 +22,7 @@ struct Options {
     config: Option<PathBuf>,
     no_syntax: bool,
     syntax_languages: Vec<String>,
+    no_update_check: bool,
 }
 
 const HELP: &str = "tdv — terminal Git diff viewer
@@ -35,6 +37,7 @@ Usage: tdv [OPTIONS] [-- PATH...]
   --no-mouse         Keep the terminal's normal mouse selection behavior
   --config FILE      Use a config file instead of the repository's .tdv.toml
   --no-syntax        Disable syntax highlighting, overriding the config
+  --no-update-check  Skip the background check for newer releases
   -h, --help         Show this help
   -V, --version      Show version
 
@@ -82,6 +85,7 @@ fn options() -> io::Result<Option<Options>> {
             "--plain" => opts.plain = true,
             "--no-mouse" => opts.no_mouse = true,
             "--no-syntax" => opts.no_syntax = true,
+            "--no-update-check" => opts.no_update_check = true,
             "--config" => {
                 opts.config =
                     Some(PathBuf::from(args.next().ok_or_else(|| {
@@ -126,9 +130,11 @@ fn run() -> io::Result<()> {
             "interactive mode needs a terminal; use --plain",
         ));
     }
+    let config = config::load(&opts.repo, opts.config.as_deref())?;
     if !opts.no_syntax {
-        opts.syntax_languages = config::load(&opts.repo, opts.config.as_deref())?;
+        opts.syntax_languages = config.syntax.languages;
     }
+    opts.no_update_check |= !config.updates.check_on_startup;
     ui::run(opts, patch)
 }
 

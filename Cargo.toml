@@ -1,6 +1,6 @@
 [package]
 name = "terminal-diff-viewer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 description = "A portable, mouse-friendly terminal Git diff viewer"
@@ -15,8 +15,19 @@ path = "src/main.rs"
 crossterm = "0.28"
 ratatui = "0.29"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+semver = "1"
+sha2 = "0.10"
+self-replace = "1.5"
+tempfile = "3"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+flate2 = "1"
+tar = "0.4"
 toml = "0.8"
 syntect = { version = "5.3", default-features = false, features = ["default-syntaxes", "default-themes", "regex-fancy"] }
+
+[target.'cfg(windows)'.dependencies]
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [profile.release]
 lto = "thin"

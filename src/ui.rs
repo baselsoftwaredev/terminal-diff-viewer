@@ -1,6 +1,7 @@
 use crate::{
     diff::{self, FileDiff, Kind},
     highlight::{Colors, Highlighter},
+    update::{Message, Release, Updater},
     Options,
 };
 use crossterm::{
@@ -41,6 +42,10 @@ struct App {
     opts: Options,
     files: Vec<Arc<FileDiff>>,
     highlights: Highlighter,
+    updater: Updater,
+    update_offer: Option<Release>,
+    update_yes: Rect,
+    update_no: Rect,
     selected: usize,
     top: usize,
     x: u16,
@@ -62,10 +67,15 @@ struct App {
 impl App {
     fn new(opts: Options, patch: &str) -> Self {
         let highlights = Highlighter::new(opts.syntax_languages.clone());
+        let updater = Updater::new(!opts.no_update_check);
         Self {
             opts,
             files: diff::parse(patch).into_iter().map(Arc::new).collect(),
             highlights,
+            updater,
+            update_offer: None,
+            update_yes: Rect::default(),
+            update_no: Rect::default(),
             selected: 0,
             top: 0,
             x: 0,
@@ -160,12 +170,44 @@ impl App {
         self.pick = 0;
     }
 
+    fn receive_update(&mut self, message: Message) {
+        match message {
+            Message::Checked(release) => self.update_offer = release,
+            Message::Installed(tag) => {
+                self.status = format!("Updated to {tag}. Restart tdv to use the new version.");
+            }
+            Message::Failed(error) => {
+                self.status = format!("Update failed: {error}");
+            }
+        }
+    }
+
     fn key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
+        }
+        // Defer the prompt while the user is typing in a picker or reading help.
+        if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+            match key.code {
+                KeyCode::Char('y' | 'Y') if key.kind == KeyEventKind::Press => {
+                    let release = self.update_offer.take().unwrap();
+                    self.status = format!("Installing {}… You can keep browsing.", release.tag);
+                    self.updater.install(release);
+                    if !self.updater.is_busy() {
+                        self.status =
+                            "Could not start update worker; current version was kept.".into();
+                    }
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter => {
+                    self.update_offer = None
+                }
+                KeyCode::Char('q') => return true,
+                _ => {}
+            }
+            return false;
         }
         if matches!(
             key.code,
@@ -282,6 +324,17 @@ impl App {
     }
 
     fn mouse(&mut self, event: event::MouseEvent) {
+        if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                let point = (event.column, event.row).into();
+                if self.update_yes.contains(point) {
+                    self.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+                } else if self.update_no.contains(point) {
+                    self.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+                }
+            }
+            return;
+        }
         if self.help || self.picker.is_some() {
             return;
         }
@@ -342,6 +395,8 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        self.update_yes = Rect::default();
+        self.update_no = Rect::default();
         let area = frame.area();
         frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
         if area.width < 30 || area.height < 6 {
@@ -470,7 +525,26 @@ impl App {
             Paragraph::new(footer).style(Style::default().fg(MUTED)),
             sections[2],
         );
-        if self.help {
+        if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+            let release = self.update_offer.as_ref().unwrap();
+            let popup = centered(area, 68, 9);
+            if popup.height >= 8 {
+                self.update_yes =
+                    Rect::new(popup.x + 1, popup.y + 5, popup.width.saturating_sub(2), 1);
+                self.update_no = Rect::new(
+                    popup.x + 1,
+                    popup.y + 6,
+                    25.min(popup.width.saturating_sub(2)),
+                    1,
+                );
+            }
+            frame.render_widget(Clear, popup);
+            frame.render_widget(Paragraph::new(format!(
+                "A newer release is available: {} → {}\n\nInstall the update now?\n\n[y] Download, verify, and install\n[n / Esc / Enter] Later     [q] Quit",
+                env!("CARGO_PKG_VERSION"), safe_name(&release.tag)))
+                .block(Block::bordered().title(" Update available "))
+                .style(Style::default().bg(BG).fg(FG)), popup);
+        } else if self.help {
             let popup = centered(area, 74, 22);
             frame.render_widget(Clear, popup);
             frame.render_widget(Paragraph::new("Mouse\n  Click files to select; double-click to expand the diff\n  Wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan horizontally\n  Tab / Enter    Switch focus / focus diff\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Toggle split view / file sidebar\n  s / r          Toggle staged changes / refresh\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
@@ -598,7 +672,14 @@ pub fn run(opts: Options, patch: String) -> io::Result<()> {
         if app.highlights.receive() {
             dirty = true;
         }
-        if app.highlights.is_enabled() && !event::poll(Duration::from_millis(32))? {
+        app.updater.start_check();
+        if let Some(message) = app.updater.receive() {
+            app.receive_update(message);
+            dirty = true;
+        }
+        if (app.highlights.is_enabled() || app.updater.is_busy() || dirty)
+            && !event::poll(Duration::from_millis(32))?
+        {
             continue;
         }
         dirty = true;
@@ -621,6 +702,42 @@ pub fn run(opts: Options, patch: String) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn update_prompt_requires_explicit_consent_and_defers_while_typing() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(Options::default(), diff::DEMO);
+        let release = Release {
+            tag: "v0.3.0".into(),
+            asset: "tdv-test.tar.gz".into(),
+        };
+        app.open_picker();
+        app.receive_update(Message::Checked(Some(release.clone())));
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert_eq!(app.picker.as_deref(), Some("y"));
+        assert!(!app.updater.is_busy());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Update available"));
+        assert!(screen.contains("v0.3.0"));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.update_offer.is_none());
+        assert!(!app.updater.is_busy());
+        app.receive_update(Message::Checked(Some(release)));
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.update_offer.is_none());
+        app.receive_update(Message::Installed("v0.3.0".into()));
+        assert!(app.status.contains("Restart"));
+        app.receive_update(Message::Failed("checksum mismatch".into()));
+        assert!(app.status.contains("checksum mismatch"));
+    }
     #[test]
     fn shortcuts_picker_and_bounds() {
         let mut app = App::new(Options::default(), diff::DEMO);
