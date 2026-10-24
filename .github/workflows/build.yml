@@ -27,6 +27,8 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: sh -n install.sh
       - run: python3 scripts/test_install.py
+      - run: sh -n scripts/release.sh
+      - run: python3 scripts/test_release.py
 
   build:
     name: Build ${{ matrix.target }}

@@ -147,6 +147,7 @@ cargo clippy --all-targets --locked -- -D warnings
 cargo fmt --check
 sh -n install.sh
 python3 scripts/test_install.py
+python3 scripts/test_release.py
 ```
 
 Automated tests cover parsing, line alignment, navigation, rendering at several terminal sizes, config discovery and defaults, language selection, update consent and checksum validation, and CLI behavior against a temporary Git repository. CI runs native tests and binary smoke checks on all five release platforms. Interactive terminal behavior is tested locally on macOS; other terminal environments may vary.
@@ -155,11 +156,23 @@ Automated tests cover parsing, line alignment, navigation, rendering at several 
 
 GitHub Actions runs formatting, lint, installer tests, and native Rust tests, then builds archives for Apple Silicon Mac, Intel Mac, Linux x86_64, Linux ARM64, and Windows x64. Each push to `main`, pull request, and manual workflow run produces downloadable Actions artifacts. Version tags also publish a GitHub Release once every build succeeds.
 
-To publish a version, first update `Cargo.toml` and run `cargo check` to update `Cargo.lock`, commit those changes, then create and push the matching tag:
+Commit the intended source changes on `main`, then publish with one command:
 
 ```sh
-git tag v0.3.0
-git push origin main v0.3.0
+sh scripts/release.sh
 ```
 
-The tag must match the package version. The pipeline uploads all five archives, `SHA256SUMS`, and `install.sh` to a draft release before publishing it. A failed build leaves no new public release. A rerun can complete a draft, but refuses to overwrite an already published release. The workflow uses GitHub's built-in token; no publishing secret is needed.
+The script checks your GitHub login and repository state, increments the patch version, updates the lockfile, runs the Rust/installer/release tests and lint checks, builds and smoke-tests the local release binary, commits only the version files, creates the version tag, and pushes `main` and the tag together. It then waits for GitHub to build all five platforms and verifies that the published release has every archive, checksum manifest, and installer. Existing installations with startup checks enabled will offer the update on their next interactive launch. Installing it still requires their confirmation.
+
+Options:
+
+```sh
+sh scripts/release.sh --dry-run          # Show the plan without writes or network calls
+sh scripts/release.sh --minor            # e.g. 0.3.1 → 0.4.0
+sh scripts/release.sh --major            # e.g. 0.4.0 → 1.0.0
+sh scripts/release.sh --version 0.5.0     # Choose an explicit newer stable version
+sh scripts/release.sh --resume v0.3.1     # Finish or retry an interrupted release
+sh scripts/release.sh --no-wait          # Push and return; builds continue on GitHub
+```
+
+Run the release command from a clean checkout on `main`, with Rust, Python 3, Git, and an authenticated GitHub CLI available. It refuses to publish uncommitted source changes, overwrite existing tags, or force-push. Validation failures restore the original version files. A failed push or GitHub build can be resumed with the same version instead of creating another version. The release workflow uploads all assets to a draft before publishing; failed builds leave the previous public release available. The workflow uses GitHub's built-in token, so no additional publishing secret is needed.
