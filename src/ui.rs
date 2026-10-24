@@ -1,6 +1,7 @@
 use crate::{
     diff::{self, FileDiff, Kind},
     highlight::{Colors, Highlighter},
+    setup::{Action as SetupAction, Setup},
     update::{Message, Release, Updater},
     Options,
 };
@@ -39,6 +40,7 @@ impl Drop for Cleanup {
 }
 
 struct App {
+    setup: Option<Setup>,
     opts: Options,
     files: Vec<Arc<FileDiff>>,
     highlights: Highlighter,
@@ -65,10 +67,13 @@ struct App {
 }
 
 impl App {
-    fn new(opts: Options, patch: &str) -> Self {
+    fn new(mut opts: Options, patch: &str) -> Self {
         let highlights = Highlighter::new(opts.syntax_languages.clone());
-        let updater = Updater::new(!opts.no_update_check);
+        let updater = Updater::new(opts.check_updates);
+        let setup = opts.setup.take();
+        let status = std::mem::take(&mut opts.startup_notice);
         Self {
+            setup,
             opts,
             files: diff::parse(patch).into_iter().map(Arc::new).collect(),
             highlights,
@@ -86,7 +91,7 @@ impl App {
             picker: None,
             pick: 0,
             help: false,
-            status: String::new(),
+            status,
             list_area: Rect::default(),
             body_area: Rect::default(),
             viewport: 1,
@@ -182,12 +187,48 @@ impl App {
         }
     }
 
+    fn setup_action(&mut self, action: SetupAction) -> bool {
+        match action {
+            SetupAction::Quit => return true,
+            SetupAction::Skip => self.setup = None,
+            SetupAction::Save => {
+                let Some(setup) = &mut self.setup else {
+                    return false;
+                };
+                match setup.target.save(&setup.config, setup.replace) {
+                    Ok(()) => {
+                        self.opts.syntax_languages = if self.opts.no_syntax {
+                            Vec::new()
+                        } else {
+                            setup.config.syntax.languages.clone()
+                        };
+                        self.opts.check_updates =
+                            !self.opts.no_update_check && setup.config.updates.check_on_startup;
+                        self.highlights = Highlighter::new(self.opts.syntax_languages.clone());
+                        self.updater = Updater::new(self.opts.check_updates);
+                        self.status =
+                            "Saved .tdv.toml; ignored locally. Use tdv --setup to reconfigure."
+                                .into();
+                        self.setup = None;
+                    }
+                    Err(error) => setup.error = Some(error.to_string()),
+                }
+            }
+            SetupAction::None => {}
+        }
+        false
+    }
+
     fn key(&mut self, key: KeyEvent) -> bool {
         if key.kind == KeyEventKind::Release {
             return false;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return true;
+        }
+        if let Some(setup) = &mut self.setup {
+            let action = setup.key(key);
+            return self.setup_action(action);
         }
         // Defer the prompt while the user is typing in a picker or reading help.
         if self.update_offer.is_some() && self.picker.is_none() && !self.help {
@@ -324,6 +365,11 @@ impl App {
     }
 
     fn mouse(&mut self, event: event::MouseEvent) {
+        if let Some(setup) = &mut self.setup {
+            let action = setup.mouse(event);
+            self.setup_action(action);
+            return;
+        }
         if self.update_offer.is_some() && self.picker.is_none() && !self.help {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 let point = (event.column, event.row).into();
@@ -525,7 +571,9 @@ impl App {
             Paragraph::new(footer).style(Style::default().fg(MUTED)),
             sections[2],
         );
-        if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+        if let Some(setup) = &mut self.setup {
+            setup.draw(frame);
+        } else if self.update_offer.is_some() && self.picker.is_none() && !self.help {
             let release = self.update_offer.as_ref().unwrap();
             let popup = centered(area, 68, 9);
             if popup.height >= 8 {
@@ -666,18 +714,24 @@ pub fn run(opts: Options, patch: String) -> io::Result<()> {
         }
         // First paint always precedes the first syntax request. Neither sending
         // requests nor collecting colors waits for the background worker.
-        if let Some(file) = app.files.get(app.selected) {
-            app.highlights.request(app.selected, file);
+        if app.setup.is_none() {
+            if let Some(file) = app.files.get(app.selected) {
+                app.highlights.request(app.selected, file);
+            }
+            app.updater.start_check();
         }
         if app.highlights.receive() {
             dirty = true;
         }
-        app.updater.start_check();
         if let Some(message) = app.updater.receive() {
             app.receive_update(message);
             dirty = true;
         }
-        if (app.highlights.is_enabled() || app.updater.is_busy() || dirty)
+        // Paint new prompts before processing their confirmation keys.
+        if dirty {
+            continue;
+        }
+        if (app.highlights.is_enabled() || app.updater.is_busy())
             && !event::poll(Duration::from_millis(32))?
         {
             continue;

@@ -107,3 +107,18 @@ fn demo_help_and_non_repository_error() {
     assert!(!out.status.success());
     assert!(!out.stderr.is_empty());
 }
+
+#[test]
+fn plain_output_and_noninteractive_setup_never_create_preferences() {
+    let repo = Repo::new();
+    let exclude = repo.0.join(".git/info/exclude");
+    let previous = fs::read(&exclude).unwrap();
+    assert!(repo.tdv(&["--plain"]).status.success());
+    assert!(repo.tdv(&["--no-setup"]).status.success());
+    let out = repo.tdv(&["--setup"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
+    assert!(!repo.0.join(".tdv.toml").exists());
+    assert_eq!(fs::read(&exclude).unwrap(), previous);
+    assert!(!repo.tdv(&["--setup", "--no-setup"]).status.success());
+}

@@ -1,6 +1,7 @@
 mod config;
 mod diff;
 mod highlight;
+mod setup;
 mod ui;
 mod update;
 
@@ -23,6 +24,11 @@ struct Options {
     no_syntax: bool,
     syntax_languages: Vec<String>,
     no_update_check: bool,
+    check_updates: bool,
+    force_setup: bool,
+    skip_setup: bool,
+    setup: Option<setup::Setup>,
+    startup_notice: String,
 }
 
 const HELP: &str = "tdv — terminal Git diff viewer
@@ -38,6 +44,8 @@ Usage: tdv [OPTIONS] [-- PATH...]
   --config FILE      Use a config file instead of the repository's .tdv.toml
   --no-syntax        Disable syntax highlighting, overriding the config
   --no-update-check  Skip the background check for newer releases
+  --setup            Configure this repository's local preferences
+  --no-setup         Skip first-run setup without creating local files
   -h, --help         Show this help
   -V, --version      Show version
 
@@ -86,6 +94,8 @@ fn options() -> io::Result<Option<Options>> {
             "--no-mouse" => opts.no_mouse = true,
             "--no-syntax" => opts.no_syntax = true,
             "--no-update-check" => opts.no_update_check = true,
+            "--setup" => opts.force_setup = true,
+            "--no-setup" => opts.skip_setup = true,
             "--config" => {
                 opts.config =
                     Some(PathBuf::from(args.next().ok_or_else(|| {
@@ -102,6 +112,11 @@ fn options() -> io::Result<Option<Options>> {
                 )))
             }
         }
+    }
+    if opts.force_setup && (opts.skip_setup || opts.config.is_some() || opts.demo || opts.plain) {
+        return Err(io::Error::other(
+            "--setup cannot be combined with --no-setup, --config, --demo, or --plain",
+        ));
     }
     Ok(Some(opts))
 }
@@ -122,6 +137,9 @@ fn run() -> io::Result<()> {
     };
     let patch = opts.patch()?;
     if opts.plain || !io::stdout().is_terminal() {
+        if opts.force_setup {
+            return Err(io::Error::other("--setup requires an interactive terminal"));
+        }
         print!("{patch}");
         return Ok(());
     }
@@ -131,10 +149,19 @@ fn run() -> io::Result<()> {
         ));
     }
     let config = config::load(&opts.repo, opts.config.as_deref())?;
+    if !opts.demo && opts.config.is_none() && !opts.skip_setup {
+        let target = config::LocalConfig::discover(&opts.repo)?;
+        let exists = target.path.try_exists()?;
+        if opts.force_setup || !exists {
+            opts.setup = Some(setup::Setup::new(target, config.clone(), exists));
+        } else if let Err(error) = target.ensure_ignored() {
+            opts.startup_notice = format!("Local config: {error}");
+        }
+    }
     if !opts.no_syntax {
         opts.syntax_languages = config.syntax.languages;
     }
-    opts.no_update_check |= !config.updates.check_on_startup;
+    opts.check_updates = !opts.no_update_check && config.updates.check_on_startup;
     ui::run(opts, patch)
 }
 

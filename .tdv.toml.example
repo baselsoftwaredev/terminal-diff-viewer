@@ -1,4 +1,4 @@
-# Copy to .tdv.toml at the root of each repository to opt in.
+# Run tdv --setup to create a locally ignored .tdv.toml in each repository.
 # With no config, or an empty languages array, syntax highlighting is off.
 [syntax]
 languages = ["csharp", "cpp", "rust"]

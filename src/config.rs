@@ -1,24 +1,25 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
 };
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub syntax: Syntax,
     pub updates: Updates,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Syntax {
     pub languages: Vec<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Updates {
     pub check_on_startup: bool,
@@ -81,9 +82,229 @@ pub fn load(repo: &Path, explicit: Option<&Path>) -> io::Result<Config> {
     parse(&text).map_err(|err| io::Error::other(format!("{}: {err}", path.display())))
 }
 
+#[derive(Debug)]
+pub struct LocalConfig {
+    pub path: PathBuf,
+    root: PathBuf,
+    exclude: PathBuf,
+}
+
+fn git_path(repo: &Path, args: &[&str]) -> io::Result<PathBuf> {
+    let output = Command::new("git").current_dir(repo).args(args).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    Ok(PathBuf::from(
+        String::from_utf8_lossy(&output.stdout).trim_end_matches(['\r', '\n']),
+    ))
+}
+
+impl LocalConfig {
+    pub fn discover(repo: &Path) -> io::Result<Self> {
+        let root = git_path(repo, &["rev-parse", "--show-toplevel"])?;
+        // Let Git resolve linked worktrees and .git files, rather than assuming a directory.
+        let exclude = git_path(&root, &["rev-parse", "--git-path", "info/exclude"])?;
+        let exclude = if exclude.is_absolute() {
+            exclude
+        } else {
+            root.join(exclude)
+        };
+        Ok(Self {
+            path: root.join(".tdv.toml"),
+            root,
+            exclude,
+        })
+    }
+
+    pub fn is_tracked(&self) -> io::Result<bool> {
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .args(["ls-files", "--error-unmatch", "--", ".tdv.toml"])
+            .output()?;
+        Ok(output.status.success())
+    }
+
+    fn is_ignored(&self) -> io::Result<bool> {
+        let output = Command::new("git")
+            .current_dir(&self.root)
+            .args(["check-ignore", "--quiet", "--no-index", "--", ".tdv.toml"])
+            .output()?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            _ => Err(io::Error::other(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            )),
+        }
+    }
+
+    pub fn ensure_ignored(&self) -> io::Result<()> {
+        if self.is_tracked()? {
+            return Err(io::Error::other(".tdv.toml is already tracked; untrack it first or use --config with a file outside the repository"));
+        }
+        if self.is_ignored()? {
+            return Ok(());
+        }
+        let existing = match fs::read(&self.exclude) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        let rule = b"\n# Local terminal-diff-viewer preferences\n/.tdv.toml\n";
+        if !existing.ends_with(rule) {
+            if let Some(parent) = self.exclude.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.exclude)?;
+            if !existing.is_empty() && !existing.ends_with(b"\n") {
+                file.write_all(b"\n")?;
+            }
+            file.write_all(rule)?;
+            file.flush()?;
+        }
+        if !self.is_ignored()? {
+            return Err(io::Error::other("the repository's .gitignore overrides the local exclusion; use --config outside the repository or adjust that rule before saving"));
+        }
+        Ok(())
+    }
+
+    pub fn save(&self, config: &Config, replace: bool) -> io::Result<()> {
+        // Establish the ignore rule before making any preferences file visible.
+        self.ensure_ignored()?;
+        let content = format!(
+            "# Local tdv preferences. Managed by tdv --setup.\n{}",
+            toml::to_string_pretty(config).map_err(io::Error::other)?
+        );
+        let mut temporary = tempfile::NamedTempFile::new_in(&self.root)?;
+        temporary.write_all(content.as_bytes())?;
+        temporary.flush()?;
+        if replace {
+            temporary.persist(&self.path).map_err(|e| e.error)?;
+        } else {
+            temporary
+                .persist_noclobber(&self.path)
+                .map_err(|e| e.error)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn git(repo: &Path, args: &[&str]) {
+        let result = Command::new("git")
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    fn repository() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "--quiet"]);
+        root
+    }
+    #[test]
+    fn saved_preferences_are_local_ignored_and_idempotent() {
+        let root = repository();
+        fs::write(root.path().join(".gitignore"), "/target\n").unwrap();
+        let target = LocalConfig::discover(root.path()).unwrap();
+        let previous = fs::read(&target.exclude).unwrap();
+        let mut config = Config::default();
+        config.syntax.languages = vec!["rust".into()];
+        config.updates.check_on_startup = false;
+        target.save(&config, false).unwrap();
+        assert!(target.is_ignored().unwrap());
+        assert!(!target.is_tracked().unwrap());
+        assert!(fs::read(&target.exclude).unwrap().starts_with(&previous));
+        assert_eq!(
+            fs::read_to_string(root.path().join(".gitignore")).unwrap(),
+            "/target\n"
+        );
+        let rules = fs::read(&target.exclude).unwrap();
+        target.ensure_ignored().unwrap();
+        assert_eq!(rules, fs::read(&target.exclude).unwrap());
+        let loaded = load(root.path(), None).unwrap();
+        assert_eq!(loaded.syntax.languages, ["rust"]);
+        assert!(!loaded.updates.check_on_startup);
+        let output = Command::new("git")
+            .current_dir(root.path())
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .output()
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(".tdv.toml"));
+    }
+    #[test]
+    fn first_run_never_overwrites_an_existing_config() {
+        let root = repository();
+        let target = LocalConfig::discover(root.path()).unwrap();
+        fs::write(&target.path, "[syntax]\nlanguages = ['cpp']\n").unwrap();
+        assert!(target.save(&Config::default(), false).is_err());
+        assert_eq!(load(root.path(), None).unwrap().syntax.languages, ["c++"]);
+        target.save(&Config::default(), true).unwrap();
+        assert!(load(root.path(), None).unwrap().syntax.languages.is_empty());
+    }
+    #[test]
+    fn tracked_configs_and_overriding_rules_are_not_silently_changed() {
+        let root = repository();
+        let target = LocalConfig::discover(root.path()).unwrap();
+        fs::write(root.path().join(".gitignore"), "!/.tdv.toml\n").unwrap();
+        assert!(target.save(&Config::default(), false).is_err());
+        assert!(!target.path.exists());
+        fs::write(root.path().join(".gitignore"), "").unwrap();
+        fs::write(&target.path, "# tracked config\n").unwrap();
+        git(root.path(), &["add", "-f", ".tdv.toml"]);
+        assert!(target.save(&Config::default(), true).is_err());
+        assert_eq!(
+            fs::read_to_string(&target.path).unwrap(),
+            "# tracked config\n"
+        );
+    }
+    #[test]
+    fn linked_worktree_uses_the_correct_exclude_file() {
+        let root = repository();
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        );
+        let linked = root.path().join("linked");
+        git(
+            root.path(),
+            &["worktree", "add", "--detach", linked.to_str().unwrap()],
+        );
+        let nested = linked.join("src");
+        fs::create_dir(&nested).unwrap();
+        let target = LocalConfig::discover(&nested).unwrap();
+        target.save(&Config::default(), false).unwrap();
+        assert!(target.is_ignored().unwrap());
+        assert!(linked.join(".tdv.toml").is_file());
+        assert!(!root.path().join(".tdv.toml").exists());
+        assert!(fs::read_to_string(root.path().join(".git/info/exclude"))
+            .unwrap()
+            .contains("/.tdv.toml"));
+    }
     #[test]
     fn default_off_and_language_aliases() {
         assert!(parse("").unwrap().syntax.languages.is_empty());

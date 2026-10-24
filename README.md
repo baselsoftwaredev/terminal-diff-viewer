@@ -68,20 +68,28 @@ Output automatically uses plain text when redirected or piped. A repository with
 
 ## Enable languages per repository
 
+The first interactive launch in a Git repository opens a local setup screen. Choose C#, C++, Rust, and startup update preferences with the mouse or keyboard. Languages start off; startup update checks start on. Press Enter to save, or Esc to skip for this launch. Update checks wait until you finish or skip setup.
+
+Saving creates `.tdv.toml` in the repository root and adds a local exclusion in Git's `info/exclude`. The config stays on your machine and is excluded from ordinary `git add` and commits. No shared `.gitignore` edit is needed. Git resolves the exclusion path for linked worktrees too. The app also ensures existing, untracked default config is locally ignored on normal interactive launches.
+
+Run `tdv --setup` to reopen setup and save new preferences. Existing files are not automatically overwritten; reconfiguration only writes after you select Save. Additional languages previously configured by hand are preserved. Use `tdv --no-setup` to bypass setup and automatic ignore changes for one launch. Demo mode, redirected output, and `--plain` do not run setup or write local preferences.
+
+If a config is already tracked, tdv does not untrack it automatically. Untrack it yourself or use `--config` with a file outside the repository. If a shared `.gitignore` explicitly forces the file to be included, setup reports the conflict rather than saving preferences that Git would expose.
+
 Syntax highlighting is **off by default for every language**. With no config, the viewer starts no highlighting thread and loads no syntax definitions or themes. Added/removed diff colors always remain available.
 
-Create `.tdv.toml` at the root of a repository to opt in to the languages you want:
+The saved file can also be edited directly to opt in to the languages you want:
 
 ```toml
 [syntax]
 languages = ["csharp", "cpp", "rust"]
 ```
 
-This enables C# (`.cs`, `.csx`), C++ (including `.cpp` and `.hpp`), and Rust (`.rs`). Python, Ruby, Go, and every other language remain unhighlighted. Set `languages = []` or remove the file to disable highlighting completely. Copy [.tdv.toml.example](.tdv.toml.example) for a starting point.
+This enables C# (`.cs`, `.csx`), C++ (including `.cpp` and `.hpp`), and Rust (`.rs`). Python, Ruby, Go, and every other language remain unhighlighted. Set `languages = []` to disable highlighting completely. Removing the config causes setup to appear again. [.tdv.toml.example](.tdv.toml.example) shows the supported structure.
 
 Names are case-insensitive. `C#`/`cs` and `C++`/`cxx` are also accepted; other bundled languages can be selected using their Syntect grammar names, such as `Python`, `Ruby`, `Go`, `JavaScript`, `JSON`, or `Markdown`. Names that do not match a bundled grammar enable nothing. You can use `shell` for Bash. Files are detected by extension or recognized filename; there is no content-based language guessing.
 
-Config discovery uses the Git repository root, including when launched from a subfolder or with `--repo`. Outside Git (for example in demo mode), it checks the specified directory. Use `--config /path/to/config.toml` to choose a different file; relative explicit paths resolve from the current working directory. `--no-syntax` overrides the config. Restart `tdv` after changing config; `r` refreshes the patch, not the config. Plain-text output ignores highlighting configuration entirely.
+Config discovery uses the Git repository root, including when launched from a subfolder or with `--repo`. Outside Git (for example in demo mode), it checks the specified directory. Use `--config /path/to/config.toml` to choose a different file and bypass automatic setup and ignore changes; relative explicit paths resolve from the current working directory. `--no-syntax` overrides the config. Setup choices apply immediately after saving. Restart `tdv` after editing config by hand; `r` refreshes the patch, not the config. Plain-text output ignores highlighting configuration entirely.
 
 Grammars remain bundled in the executable. When you opt in, the background worker loads the bundled syntax catalog and only parses files whose language is enabled. Config controls runtime highlighting rather than reducing the executable size or removing catalog entries.
 
@@ -150,8 +158,8 @@ GitHub Actions runs formatting, lint, installer tests, and native Rust tests, th
 To publish a version, first update `Cargo.toml` and run `cargo check` to update `Cargo.lock`, commit those changes, then create and push the matching tag:
 
 ```sh
-git tag v0.2.0
-git push origin main v0.2.0
+git tag v0.3.0
+git push origin main v0.3.0
 ```
 
 The tag must match the package version. The pipeline uploads all five archives, `SHA256SUMS`, and `install.sh` to a draft release before publishing it. A failed build leaves no new public release. A rerun can complete a draft, but refuses to overwrite an already published release. The workflow uses GitHub's built-in token; no publishing secret is needed.
