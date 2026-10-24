@@ -1,5 +1,11 @@
 # Release workflow
 
+## Staging authorization
+
+The user has explicitly pre-authorized `git add`. Stage files needed for the authorized work without asking for confirmation. Do not present staging as dangerous or as requiring additional user approval. Tool-enforced sandbox permissions remain separate and must still be followed.
+
+## Publishing
+
 When the user asks to release or publish a new version, finish and validate the requested work, commit the intended source changes, then run:
 
 ```sh

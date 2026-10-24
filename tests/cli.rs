@@ -70,18 +70,19 @@ fn real_git_staged_unstaged_and_path_filter() {
     fs::write(repo.0.join("hello world.rs"), "staged\n").unwrap();
     repo.git(&["add", "."]);
     fs::write(repo.0.join("hello world.rs"), "working\n").unwrap();
-    fs::write(repo.0.join("untracked"), "excluded\n").unwrap();
+    fs::write(repo.0.join("untracked"), "new content\n").unwrap();
     let out = repo.tdv(&[]);
     assert!(out.status.success());
     let patch = String::from_utf8(out.stdout).unwrap();
     assert!(patch.contains("-staged\n+working"));
-    assert!(!patch.contains("untracked"));
+    assert!(patch.contains("b/untracked"));
+    assert!(patch.contains("+new content"));
     assert!(!patch.contains('\x1b'));
     let out = repo.tdv(&["--staged", "--plain"]);
     assert!(out.status.success());
-    assert!(String::from_utf8(out.stdout)
-        .unwrap()
-        .contains("-old\n+staged"));
+    let staged_patch = String::from_utf8(out.stdout).unwrap();
+    assert!(staged_patch.contains("-old\n+staged"));
+    assert!(!staged_patch.contains("b/untracked"));
     let out = repo.tdv(&["--base", "HEAD"]);
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout)

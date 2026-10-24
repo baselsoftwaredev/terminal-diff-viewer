@@ -6,3 +6,7 @@ languages = ["csharp", "cpp", "rust"]
 # Startup update checks are enabled by default. Set false to opt out.
 [updates]
 check_on_startup = true
+
+# Reload Git changes in the background while the viewer is open.
+[refresh]
+auto = true

@@ -1,6 +1,6 @@
 # tdv — terminal diff viewer
 
-A Rust terminal application for browsing Git changes with a mouse or keyboard. Includes side-by-side and unified views, syntax highlighting, line numbers, a file sidebar, a file picker, and hunk navigation. Repository operations only read diffs.
+A Rust terminal application for browsing Git changes with a mouse or keyboard. The default view shows the full current file, with change markers and a previous-code popup. Includes automatic refresh, new files, optional unified/split diffs, syntax highlighting, line numbers, a file sidebar, a file picker, and change navigation.
 
 ## Install on another Mac or Linux machine
 
@@ -52,9 +52,9 @@ tdv
 The compiled executable does not require Rust to run. Build for each operating system and CPU you want to support.
 
 ```sh
-tdv                         # Unstaged changes in tracked files
+tdv                         # Working-tree edits and new, untracked files
 tdv --staged                # Index compared to HEAD
-tdv --base HEAD             # Tracked changes compared to HEAD
+tdv --base HEAD             # Working-tree changes and new files against HEAD
 tdv --base main -- src      # Compare src against main
 tdv --repo ../another-repo
 tdv --no-mouse              # Preserve terminal text selection
@@ -62,9 +62,31 @@ tdv --plain                 # Print a patch without the TUI
 tdv --demo                  # Try the interface without a Git repository
 tdv --demo --config .tdv.toml.example  # Try Rust syntax colors
 tdv --no-syntax             # Override the repository's highlighting config
+tdv --no-auto-refresh       # Refresh only when r is pressed
 ```
 
-Output automatically uses plain text when redirected or piped. A repository with no changes shows an empty state. Use `r` to refresh after editing files externally.
+Output automatically uses plain text when redirected or piped. A repository with no changes shows an empty state. Interactive views refresh automatically; `r` requests an immediate background refresh.
+
+## Read the full current file
+
+The default **Current** view shows every line of the selected changed file, including unchanged lines outside Git's patch context. The gutter marks `+` for new lines, `~` for replacement lines, and `-` for a deletion boundary beside a surviving line. Click a marked line, or select it with Up/Down and press Enter, to see previous code in a scrollable popup. Added files are labeled `new`; they show their full contents as additions. Ignored files stay hidden.
+
+In unstaged views the current contents come from the working tree, including untracked files. Staged views read the Git index, so unstaged edits do not appear there. Deleted files show a message and let you inspect the previous code. Empty and binary files are listed with a suitable empty state or metadata.
+
+Press `v` to cycle **Current → Unified → Split**. Plain-text output remains a patch and includes new, untracked files for unstaged views. Viewing files never stages them or changes the Git index.
+
+## Automatic refresh
+
+While the interactive viewer is open, a background worker checks Git status and file metadata about once a second. Edits, repeated changes to an already modified file, additions, deletions, staging, and commits trigger a background reload. Unchanged snapshots do not repaint the view. The selected file, horizontal offset, cursor line, and scroll position are retained where possible. A previous-code popup or file picker stays stable until you close it; the newest snapshot is then applied.
+
+Use `--no-auto-refresh` for manual refresh with `r`, or disable it per repository:
+
+```toml
+[refresh]
+auto = false
+```
+
+The initial diff still loads before the UI opens. Later Git commands and file reads run in the background. Large repositories may take longer to refresh; the interface remains usable while a reload is pending. Polling is off in demo, plain-text, and noninteractive modes.
 
 ## Enable languages per repository
 
@@ -112,13 +134,14 @@ Checks have a five-second network timeout and never block scrolling or quitting.
 
 | Action | Keyboard | Mouse |
 | --- | --- | --- |
-| Scroll vertically | Up/Down, j/k, PgUp/PgDn, Space | Wheel over the diff |
+| Move through code / scroll | Up/Down, j/k, PgUp/PgDn, Space | Wheel over the code |
 | Scroll horizontally | Left/Right, h/l | Horizontal wheel or Shift+wheel |
 | Switch focus | Tab, Enter to focus diff | Click file list or diff |
+| Inspect previous code | Enter on a marked line; Esc closes | Click a changed line; click popup to close |
 | Previous/next file | `[` / `]` | Click a file; wheel over file list |
 | Previous/next hunk | p / n | |
 | Start/end of file | Home/End, g/G | |
-| Split/unified view | v | Click view in top bar |
+| Current/unified/split view | v | Click view in top bar |
 | Staged/unstaged | s | Click source in top bar |
 | Find a file | Ctrl+P, `/`, double-Shift where supported | Click Find file in top bar |
 | Select in file picker | Up/Down, Enter; Esc closes | |
@@ -135,9 +158,9 @@ Uses Ratatui with Crossterm, which supports macOS, Linux, and Windows terminals.
 
 When enabled, syntax highlighting runs on a background thread using Syntect's bundled grammars and the base16-ocean.dark theme. The diff paints immediately with added/removed colors; syntax colors arrive afterward without needing another keypress. Navigation and quitting never wait for syntax parsing. Old/new sides use separate parser states, diff backgrounds remain visible, and up to four files' results are cached. Refreshing invalidates that cache and rejects stale results. No grammar downloads or external highlighter executable are needed.
 
-Unknown languages and large patches keep plain diff colors. Highlighting skips files over 512 KiB of patch text, 10,000 patch lines, 8,192 bytes in a line, or 50,000 syntax tokens. Highlighting uses available patch context and resets at each hunk, so constructs beginning outside that context may be colored approximately. Cancellation is checked between lines; a slow regex may delay the next file's highlighting, while the interface continues to work.
+Unknown languages and large files keep basic colors. Highlighting skips files over 512 KiB or 10,000 lines of combined patch/current text, 8,192 bytes in a line, or 50,000 syntax tokens. The current-file highlighter parses the complete file, preserving multiline context. Diff and previous-code highlighting use available patch context and reset at each hunk, so constructs beginning outside that context may be colored approximately. Cancellation is checked between lines; a slow regex may delay the next file's highlighting, while the interface continues to work.
 
-This initial version shows tracked Git changes, including staged new files. Untracked files are excluded. Renames appear as deletion/addition pairs, binary changes show Git's metadata, and only patch context is displayed. It does not edit files, stage changes, or show an entire unchanged file. Git patch loading and parsing still happen before the initial display and synchronously on refresh; very large diffs may pause during that step. Paths with unusual characters may appear in Git's quoted format. Tabs display as four spaces, and terminal control characters are replaced for display. Plain-text output bypasses syntax highlighting entirely.
+The file list includes changed tracked files, staged additions, and untracked files in unstaged views. Renames appear as deletion/addition pairs. It does not edit files, stage changes, or browse unchanged files that have no Git changes. File contents are loaded on selection and by background refresh. Paths with unusual characters may appear in Git's quoted format in plain patches. Tabs display as four spaces, and terminal control characters are replaced for display. Plain-text output bypasses syntax highlighting entirely.
 
 Validation:
 
@@ -148,6 +171,7 @@ cargo fmt --check
 sh -n install.sh
 python3 scripts/test_install.py
 python3 scripts/test_release.py
+python3 scripts/test_terminal.py --binary target/release/tdv  # Optional POSIX terminal smoke test after building
 ```
 
 Automated tests cover parsing, line alignment, navigation, rendering at several terminal sizes, config discovery and defaults, language selection, update consent and checksum validation, and CLI behavior against a temporary Git repository. CI runs native tests and binary smoke checks on all five release platforms. Interactive terminal behavior is tested locally on macOS; other terminal environments may vary.

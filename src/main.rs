@@ -1,6 +1,7 @@
 mod config;
 mod diff;
 mod highlight;
+mod refresh;
 mod setup;
 mod ui;
 mod update;
@@ -29,6 +30,8 @@ struct Options {
     skip_setup: bool,
     setup: Option<setup::Setup>,
     startup_notice: String,
+    no_auto_refresh: bool,
+    auto_refresh: bool,
 }
 
 const HELP: &str = "tdv — terminal Git diff viewer
@@ -44,17 +47,19 @@ Usage: tdv [OPTIONS] [-- PATH...]
   --config FILE      Use a config file instead of the repository's .tdv.toml
   --no-syntax        Disable syntax highlighting, overriding the config
   --no-update-check  Skip the background check for newer releases
+  --no-auto-refresh  Refresh only when r is pressed
   --setup            Configure this repository's local preferences
   --no-setup         Skip first-run setup without creating local files
   -h, --help         Show this help
   -V, --version      Show version
 
 Keys: arrows / hjkl navigate, Tab focus, [ / ] files, n / p hunks,
-      v split/unified, f sidebar, / or Ctrl+P file picker, r refresh,
+      v current/unified/split, Enter previous code, f sidebar, / or Ctrl+P picker,
+      r refresh,
       s staged/unstaged, ? help, q quit. Double-click a file to expand.
       Double-Shift opens the picker on terminals with enhanced key reporting.
 
-Requires Git for repository diffs. Untracked files are not included.
+Requires Git for repository diffs. New untracked files are included in unstaged views.
 Syntax highlighting is off by default. Enable languages in .tdv.toml:
   [syntax]
   languages = [\"csharp\", \"cpp\", \"rust\"]
@@ -94,6 +99,7 @@ fn options() -> io::Result<Option<Options>> {
             "--no-mouse" => opts.no_mouse = true,
             "--no-syntax" => opts.no_syntax = true,
             "--no-update-check" => opts.no_update_check = true,
+            "--no-auto-refresh" => opts.no_auto_refresh = true,
             "--setup" => opts.force_setup = true,
             "--no-setup" => opts.skip_setup = true,
             "--config" => {
@@ -122,9 +128,9 @@ fn options() -> io::Result<Option<Options>> {
 }
 
 impl Options {
-    fn patch(&self) -> io::Result<String> {
+    fn snapshot(&self) -> io::Result<diff::Snapshot> {
         if self.demo {
-            Ok(diff::DEMO.to_owned())
+            Ok(diff::Snapshot::from_patch(diff::DEMO))
         } else {
             diff::load(&self.repo, self.staged, self.base.as_deref(), &self.paths)
         }
@@ -135,12 +141,11 @@ fn run() -> io::Result<()> {
     let Some(mut opts) = options()? else {
         return Ok(());
     };
-    let patch = opts.patch()?;
     if opts.plain || !io::stdout().is_terminal() {
         if opts.force_setup {
             return Err(io::Error::other("--setup requires an interactive terminal"));
         }
-        print!("{patch}");
+        print!("{}", opts.snapshot()?.patch);
         return Ok(());
     }
     if !io::stdin().is_terminal() || env::var("TERM").is_ok_and(|v| v == "dumb") {
@@ -162,7 +167,9 @@ fn run() -> io::Result<()> {
         opts.syntax_languages = config.syntax.languages;
     }
     opts.check_updates = !opts.no_update_check && config.updates.check_on_startup;
-    ui::run(opts, patch)
+    opts.auto_refresh = !opts.no_auto_refresh && config.refresh.auto && !opts.demo;
+    let snapshot = opts.snapshot()?;
+    ui::run(opts, snapshot)
 }
 
 fn main() {

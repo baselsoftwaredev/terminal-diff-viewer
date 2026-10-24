@@ -11,6 +11,18 @@ use std::{
 pub struct Config {
     pub syntax: Syntax,
     pub updates: Updates,
+    pub refresh: Refresh,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Refresh {
+    pub auto: bool,
+}
+impl Default for Refresh {
+    fn default() -> Self {
+        Self { auto: true }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -340,6 +352,11 @@ mod tests {
                 .check_on_startup
         );
         assert!(parse("[updates]\ncheck_on_startup = 'false'").is_err());
+    }
+    #[test]
+    fn automatic_refresh_is_enabled_unless_explicitly_disabled() {
+        assert!(parse("").unwrap().refresh.auto);
+        assert!(!parse("[refresh]\nauto = false").unwrap().refresh.auto);
     }
     #[test]
     fn root_config_is_found_from_nested_directory_and_explicit_config_wins() {

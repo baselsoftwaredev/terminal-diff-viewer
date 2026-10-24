@@ -31,6 +31,7 @@ pub type Tokens = Vec<Span<'static>>;
 #[derive(Default)]
 pub struct Colors {
     pub lines: Vec<[Option<Tokens>; 2]>,
+    pub current: Vec<Option<Tokens>>,
 }
 struct Request {
     epoch: u64,
@@ -184,9 +185,19 @@ fn colorize(
     if cancelled() {
         return None;
     }
-    if file.lines.len() > MAX_LINES
-        || file.lines.iter().any(|l| l.text.len() > MAX_LINE_BYTES)
-        || file.lines.iter().map(|l| l.text.len()).sum::<usize>() > MAX_BYTES
+    if file.lines.len() + file.current.len() > MAX_LINES
+        || file
+            .lines
+            .iter()
+            .chain(&file.current)
+            .any(|l| l.text.len() > MAX_LINE_BYTES)
+        || file
+            .lines
+            .iter()
+            .chain(&file.current)
+            .map(|l| l.text.len())
+            .sum::<usize>()
+            > MAX_BYTES
     {
         return Some(Colors::default());
     }
@@ -215,6 +226,7 @@ fn colorize(
     let mut new = HighlightLines::new(syntax, theme);
     let mut result = Colors {
         lines: Vec::with_capacity(file.lines.len()),
+        current: Vec::with_capacity(file.current.len()),
     };
     let mut token_count = 0;
     for line in &file.lines {
@@ -265,6 +277,43 @@ fn colorize(
             }
         }
         result.lines.push(pair);
+    }
+    let mut current = HighlightLines::new(syntax, theme);
+    for line in &file.current {
+        if cancelled() {
+            return None;
+        }
+        let text = format!("{}\n", line.text);
+        let tokens = match current.highlight_line(&text, syntaxes) {
+            Ok(ranges) => {
+                token_count += ranges.len();
+                if token_count > MAX_TOKENS {
+                    return Some(Colors::default());
+                }
+                Some(
+                    ranges
+                        .into_iter()
+                        .filter_map(|(style, text)| {
+                            let text = text.trim_end_matches('\n');
+                            if text.is_empty() {
+                                return None;
+                            }
+                            let c = style.foreground;
+                            let mut s = Style::default().fg(Color::Rgb(c.r, c.g, c.b));
+                            if style.font_style.contains(FontStyle::BOLD) {
+                                s = s.add_modifier(Modifier::BOLD);
+                            }
+                            if style.font_style.contains(FontStyle::ITALIC) {
+                                s = s.add_modifier(Modifier::ITALIC);
+                            }
+                            Some(Span::styled(text.to_owned(), s))
+                        })
+                        .collect(),
+                )
+            }
+            Err(_) => None,
+        };
+        result.current.push(tokens);
     }
     Some(result)
 }
@@ -346,6 +395,52 @@ mod tests {
         let distinct: std::collections::HashSet<_> = tokens.map(|t| t.style.fg).collect();
         assert!(distinct.len() > 1);
         assert!(colorize(&files[0], &syntaxes, &themes, &languages, || true).is_none());
+    }
+    #[test]
+    fn full_file_highlighting_keeps_multiline_state_and_preserves_text() {
+        let mut file = crate::diff::parse(crate::diff::DEMO).remove(0);
+        file.current = ["/*", "fn inside_comment() {}", "*/", "pub fn actual() {}"]
+            .iter()
+            .enumerate()
+            .map(|(index, text)| crate::diff::Line {
+                index,
+                text: text.to_string(),
+                kind: Kind::Context,
+                old: None,
+                new: Some(index + 1),
+            })
+            .collect();
+        let colors = colorize(
+            &file,
+            &SyntaxSet::load_defaults_newlines(),
+            &ThemeSet::load_defaults(),
+            &["rust".into()],
+            || false,
+        )
+        .unwrap();
+        assert_eq!(colors.current.len(), file.current.len());
+        for (line, tokens) in file.current.iter().zip(&colors.current) {
+            assert_eq!(
+                tokens
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                line.text
+            );
+        }
+        let comment_color = colors.current[1].as_ref().unwrap()[0].style.fg;
+        assert!(colors.current[1]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .all(|span| span.style.fg == comment_color));
+        assert!(colors.current[3]
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|span| span.style.fg != comment_color));
     }
     #[test]
     fn busy_worker_does_not_block_requests_or_result_checks() {

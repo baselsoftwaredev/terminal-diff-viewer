@@ -1,6 +1,7 @@
 use crate::{
-    diff::{self, FileDiff, Kind},
+    diff::{self, ChangeKind, FileDiff, Kind, Snapshot},
     highlight::{Colors, Highlighter},
+    refresh::{Parameters, Refresher},
     setup::{Action as SetupAction, Setup},
     update::{Message, Release, Updater},
     Options,
@@ -31,6 +32,34 @@ const FG: Color = Color::Rgb(211, 220, 231);
 const MUTED: Color = Color::Rgb(132, 148, 170);
 const ACCENT: Color = Color::Rgb(114, 203, 231);
 
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Current,
+    Unified,
+    Split,
+}
+impl View {
+    fn next(self) -> Self {
+        match self {
+            Self::Current => Self::Unified,
+            Self::Unified => Self::Split,
+            Self::Split => Self::Current,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Self::Current => "Current",
+            Self::Unified => "Unified",
+            Self::Split => "Split",
+        }
+    }
+}
+struct Previous {
+    lines: Vec<diff::Line>,
+    top: usize,
+    x: u16,
+}
+
 struct Cleanup;
 impl Drop for Cleanup {
     fn drop(&mut self) {
@@ -44,6 +73,9 @@ struct App {
     opts: Options,
     files: Vec<Arc<FileDiff>>,
     highlights: Highlighter,
+    refresher: Refresher,
+    pending_snapshot: Option<Snapshot>,
+    manual_refresh: bool,
     updater: Updater,
     update_offer: Option<Release>,
     update_yes: Rect,
@@ -51,7 +83,9 @@ struct App {
     selected: usize,
     top: usize,
     x: u16,
-    split: bool,
+    view: View,
+    cursor: usize,
+    previous: Option<Previous>,
     sidebar: bool,
     file_focus: bool,
     file_state: ListState,
@@ -67,16 +101,23 @@ struct App {
 }
 
 impl App {
-    fn new(mut opts: Options, patch: &str) -> Self {
+    fn new(mut opts: Options, snapshot: Snapshot) -> Self {
         let highlights = Highlighter::new(opts.syntax_languages.clone());
         let updater = Updater::new(opts.check_updates);
         let setup = opts.setup.take();
         let status = std::mem::take(&mut opts.startup_notice);
+        let mut files: Vec<Arc<FileDiff>> = snapshot.files.into_iter().map(Arc::new).collect();
+        if let Some(file) = files.first_mut() {
+            Arc::make_mut(file).load_current();
+        }
         Self {
             setup,
             opts,
-            files: diff::parse(patch).into_iter().map(Arc::new).collect(),
+            files,
             highlights,
+            refresher: Refresher::new(),
+            pending_snapshot: None,
+            manual_refresh: false,
             updater,
             update_offer: None,
             update_yes: Rect::default(),
@@ -84,7 +125,9 @@ impl App {
             selected: 0,
             top: 0,
             x: 0,
-            split: true,
+            view: View::Current,
+            cursor: 0,
+            previous: None,
             sidebar: true,
             file_focus: false,
             file_state: ListState::default(),
@@ -106,56 +149,171 @@ impl App {
         self.top = 0;
         self.x = 0;
         self.file_state.select(Some(self.selected));
+        self.cursor = 0;
+        self.previous = None;
+        if let Some(file) = self.files.get_mut(self.selected) {
+            Arc::make_mut(file).load_current();
+        }
     }
 
     fn reload(&mut self) {
-        match self.opts.patch() {
-            Ok(patch) => {
-                let name = self.files.get(self.selected).map(|f| f.name.clone());
-                self.highlights.invalidate();
-                self.files = diff::parse(&patch).into_iter().map(Arc::new).collect();
-                let selected = self
-                    .files
-                    .iter()
-                    .position(|f| Some(&f.name) == name.as_ref())
-                    .unwrap_or(0);
-                self.select(selected);
-                self.status = "Refreshed".into();
-            }
-            Err(err) => self.status = err.to_string(),
+        self.pending_snapshot = None;
+        self.manual_refresh = true;
+        self.status = "Refreshing…".into();
+        self.request_refresh();
+    }
+
+    fn request_refresh(&mut self) {
+        self.refresher.request(
+            Parameters {
+                repo: self.opts.repo.clone(),
+                staged: self.opts.staged,
+                base: self.opts.base.clone(),
+                paths: self.opts.paths.clone(),
+                demo: self.opts.demo,
+            },
+            self.opts.auto_refresh,
+        );
+    }
+
+    fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        let name = self.files.get(self.selected).map(|f| f.name.clone());
+        let selected = snapshot
+            .files
+            .iter()
+            .position(|f| Some(&f.name) == name.as_ref())
+            .unwrap_or(self.selected.min(snapshot.files.len().saturating_sub(1)));
+        self.highlights.invalidate();
+        self.files = snapshot.files.into_iter().map(Arc::new).collect();
+        self.selected = selected;
+        if let Some(file) = self.files.get_mut(selected) {
+            Arc::make_mut(file).load_current();
         }
+        self.file_state.select(if self.files.is_empty() {
+            None
+        } else {
+            Some(selected)
+        });
+        self.clamp();
+        self.cursor = self
+            .cursor
+            .min(self.row_count().saturating_sub(1))
+            .max(self.top);
+        if self.manual_refresh || self.status.starts_with("Refresh failed:") {
+            self.status = "Refreshed".into();
+        }
+        self.manual_refresh = false;
+    }
+
+    fn refresh_tick(&mut self) -> bool {
+        if self.setup.is_some() {
+            return false;
+        }
+        if self.opts.auto_refresh && !self.refresher.started {
+            self.request_refresh();
+        }
+        self.refresher.flush();
+        let mut changed = false;
+        if let Some(reply) = self.refresher.receive() {
+            match reply.snapshot {
+                Ok(snapshot) => self.pending_snapshot = Some(snapshot),
+                Err(error) => {
+                    self.status = format!("Refresh failed: {error}");
+                    changed = true;
+                }
+            }
+        }
+        if self.previous.is_none() && self.picker.is_none() {
+            if let Some(snapshot) = self.pending_snapshot.take() {
+                self.apply_snapshot(snapshot);
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn scroll(&mut self, amount: isize) {
         self.top = self.top.saturating_add_signed(amount);
         self.clamp();
+        self.cursor = self
+            .cursor
+            .clamp(self.top, self.top + self.viewport.saturating_sub(1));
+        self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
+    }
+
+    fn row_count(&self) -> usize {
+        self.files
+            .get(self.selected)
+            .map(|file| {
+                if self.view == View::Current {
+                    file.current.len().max(1)
+                } else {
+                    file.rows(self.view == View::Split).len()
+                }
+            })
+            .unwrap_or(0)
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        self.cursor = self
+            .cursor
+            .saturating_add_signed(delta)
+            .min(self.row_count().saturating_sub(1));
+        if self.cursor < self.top {
+            self.top = self.cursor;
+        }
+        if self.cursor >= self.top + self.viewport {
+            self.top = self.cursor.saturating_sub(self.viewport.saturating_sub(1));
+        }
+    }
+
+    fn inspect_previous(&mut self) {
+        if let Some(change) = self
+            .files
+            .get(self.selected)
+            .and_then(|file| file.change_at(self.cursor))
+        {
+            self.previous = Some(Previous {
+                lines: change.previous.clone(),
+                top: 0,
+                x: 0,
+            });
+        } else {
+            self.status =
+                "This line is unchanged. Click a +, ~, or - marker to inspect a change.".into();
+        }
     }
 
     fn clamp(&mut self) {
-        let count = self
-            .files
-            .get(self.selected)
-            .map(|f| f.rows(self.split).len())
-            .unwrap_or(0);
+        let count = self.row_count();
         self.top = self.top.min(count.saturating_sub(self.viewport));
     }
 
     fn hunk(&mut self, forward: bool) {
         if let Some(file) = self.files.get(self.selected) {
-            let rows = file.rows(self.split);
-            let hunks: Vec<usize> = rows
-                .iter()
-                .enumerate()
-                .filter(|(_, (a, _))| a.is_some_and(|l| l.text.starts_with("@@ ")))
-                .map(|(i, _)| i)
-                .collect();
-            let next = if forward {
-                hunks.into_iter().find(|n| *n > self.top)
+            let hunks: Vec<usize> = if self.view == View::Current {
+                file.changes.iter().map(|change| change.start).collect()
             } else {
-                hunks.into_iter().rev().find(|n| *n < self.top)
+                let rows = file.rows(self.view == View::Split);
+                rows.iter()
+                    .enumerate()
+                    .filter(|(_, (a, _))| a.is_some_and(|l| l.text.starts_with("@@ ")))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            let position = if self.view == View::Current {
+                self.cursor
+            } else {
+                self.top
+            };
+            let next = if forward {
+                hunks.into_iter().find(|n| *n > position)
+            } else {
+                hunks.into_iter().rev().find(|n| *n < position)
             };
             if let Some(n) = next {
                 self.top = n;
+                self.cursor = n;
             }
         }
     }
@@ -204,6 +362,9 @@ impl App {
                         };
                         self.opts.check_updates =
                             !self.opts.no_update_check && setup.config.updates.check_on_startup;
+                        self.opts.auto_refresh = !self.opts.no_auto_refresh
+                            && setup.config.refresh.auto
+                            && !self.opts.demo;
                         self.highlights = Highlighter::new(self.opts.syntax_languages.clone());
                         self.updater = Updater::new(self.opts.check_updates);
                         self.status =
@@ -230,8 +391,29 @@ impl App {
             let action = setup.key(key);
             return self.setup_action(action);
         }
+        if let Some(previous) = &mut self.previous {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => self.previous = None,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    previous.top = (previous.top + 1).min(previous.lines.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => previous.top = previous.top.saturating_sub(1),
+                KeyCode::PageDown => {
+                    previous.top = (previous.top + 10).min(previous.lines.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => previous.top = previous.top.saturating_sub(10),
+                KeyCode::Right | KeyCode::Char('l') => previous.x = previous.x.saturating_add(4),
+                KeyCode::Left | KeyCode::Char('h') => previous.x = previous.x.saturating_sub(4),
+                _ => {}
+            }
+            return false;
+        }
         // Defer the prompt while the user is typing in a picker or reading help.
-        if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+        if self.update_offer.is_some()
+            && self.picker.is_none()
+            && !self.help
+            && self.previous.is_none()
+        {
             match key.code {
                 KeyCode::Char('y' | 'Y') if key.kind == KeyEventKind::Press => {
                     let release = self.update_offer.take().unwrap();
@@ -320,7 +502,8 @@ impl App {
                 self.file_focus = false;
             }
             KeyCode::Char('v') => {
-                self.split = !self.split;
+                self.view = self.view.next();
+                self.cursor = 0;
                 self.top = 0;
             }
             KeyCode::Char('s') => {
@@ -332,10 +515,18 @@ impl App {
             KeyCode::Char('[') => self.select(self.selected.saturating_sub(1)),
             KeyCode::Char('n') => self.hunk(true),
             KeyCode::Char('p') => self.hunk(false),
-            KeyCode::Enter => self.file_focus = false,
+            KeyCode::Enter => {
+                if self.file_focus {
+                    self.file_focus = false;
+                } else if self.view == View::Current {
+                    self.inspect_previous();
+                }
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 if self.file_focus {
                     self.select(self.selected.saturating_add(1));
+                } else if self.view == View::Current {
+                    self.move_cursor(1);
                 } else {
                     self.scroll(1);
                 }
@@ -343,6 +534,8 @@ impl App {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.file_focus {
                     self.select(self.selected.saturating_sub(1));
+                } else if self.view == View::Current {
+                    self.move_cursor(-1);
                 } else {
                     self.scroll(-1);
                 }
@@ -353,11 +546,13 @@ impl App {
             KeyCode::PageUp => self.scroll(-(self.viewport as isize)),
             KeyCode::Home | KeyCode::Char('g') => {
                 self.top = 0;
+                self.cursor = 0;
                 self.x = 0;
             }
             KeyCode::End | KeyCode::Char('G') => {
                 self.top = usize::MAX;
                 self.clamp();
+                self.cursor = self.row_count().saturating_sub(1);
             }
             _ => {}
         }
@@ -370,7 +565,24 @@ impl App {
             self.setup_action(action);
             return;
         }
-        if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+        if let Some(previous) = &mut self.previous {
+            match event.kind {
+                MouseEventKind::ScrollDown => {
+                    previous.top = (previous.top + 3).min(previous.lines.len().saturating_sub(1))
+                }
+                MouseEventKind::ScrollUp => previous.top = previous.top.saturating_sub(3),
+                MouseEventKind::ScrollRight => previous.x = previous.x.saturating_add(4),
+                MouseEventKind::ScrollLeft => previous.x = previous.x.saturating_sub(4),
+                MouseEventKind::Down(MouseButton::Left) => self.previous = None,
+                _ => {}
+            }
+            return;
+        }
+        if self.update_offer.is_some()
+            && self.picker.is_none()
+            && !self.help
+            && self.previous.is_none()
+        {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
                 let point = (event.column, event.row).into();
                 if self.update_yes.contains(point) {
@@ -388,7 +600,8 @@ impl App {
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if event.row == 0 => {
                 if event.column < 14 {
-                    self.split = !self.split;
+                    self.view = self.view.next();
+                    self.cursor = 0;
                     self.top = 0;
                 } else if event.column < 30 {
                     self.opts.staged = !self.opts.staged;
@@ -413,7 +626,21 @@ impl App {
                 }
             }
             MouseEventKind::Down(MouseButton::Left) if inside(self.body_area) => {
-                self.file_focus = false
+                self.file_focus = false;
+                if self.view == View::Current {
+                    let clicked = self.top + usize::from(event.row - self.body_area.y);
+                    if clicked >= self.row_count() {
+                        return;
+                    }
+                    self.cursor = clicked;
+                    if self
+                        .files
+                        .get(self.selected)
+                        .is_some_and(|f| f.change_at(self.cursor).is_some())
+                    {
+                        self.inspect_previous();
+                    }
+                }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if inside(self.list_area) => {
                 if event.kind == MouseEventKind::ScrollDown {
@@ -455,7 +682,7 @@ impl App {
             Constraint::Length(1),
         ])
         .split(area);
-        let mode = if self.split { "Split" } else { "Unified" };
+        let mode = self.view.name();
         let source = if self.opts.demo {
             "Demo"
         } else if self.opts.staged {
@@ -492,7 +719,11 @@ impl App {
                 .iter()
                 .map(|f| {
                     let (a, d) = f.counts();
-                    ListItem::new(format!("{} +{a} -{d}", safe_name(&f.name)))
+                    ListItem::new(format!(
+                        "{}{} +{a} -{d}",
+                        if f.is_new { "new " } else { "" },
+                        safe_name(&f.name)
+                    ))
                 })
                 .collect();
             self.file_state.select(if self.files.is_empty() {
@@ -522,12 +753,72 @@ impl App {
         frame.render_widget(block, columns[1]);
         self.viewport = self.body_area.height as usize;
         if self.files.is_empty() {
-            frame.render_widget(Paragraph::new("No changes in this view.\nPress s to switch staged/unstaged, or r to refresh.\nUntracked files are not included.").style(Style::default().fg(MUTED)), self.body_area);
+            frame.render_widget(
+                Paragraph::new(
+                    "No changes in this view.\nPress s to switch staged/unstaged, or r to refresh.",
+                )
+                .style(Style::default().fg(MUTED)),
+                self.body_area,
+            );
         } else {
             let file = &self.files[self.selected];
             let colors = self.highlights.get(self.selected);
-            let rows = file.rows(self.split);
-            if self.split {
+            let rows = if self.view == View::Current {
+                Vec::new()
+            } else {
+                file.rows(self.view == View::Split)
+            };
+            if self.view == View::Current {
+                if file.current.is_empty() {
+                    frame.render_widget(
+                        Paragraph::new(file.note.as_deref().unwrap_or("Empty file."))
+                            .style(Style::default().fg(MUTED)),
+                        self.body_area,
+                    );
+                } else {
+                    let panes = Layout::horizontal([Constraint::Length(10), Constraint::Min(1)])
+                        .split(self.body_area);
+                    let mut gutters = Vec::new();
+                    let mut contents = Vec::new();
+                    for line in file.current.iter().skip(self.top).take(self.viewport) {
+                        let change = file.change_at(line.index).map(|c| c.kind);
+                        let (sign, color, bg) = match change {
+                            Some(ChangeKind::Added) => {
+                                ("+", Color::LightGreen, Color::Rgb(23, 46, 35))
+                            }
+                            Some(ChangeKind::Modified) => {
+                                ("~", Color::Yellow, Color::Rgb(39, 39, 27))
+                            }
+                            Some(ChangeKind::Removed) => {
+                                ("-", Color::LightRed, Color::Rgb(52, 30, 37))
+                            }
+                            None => (" ", MUTED, BG),
+                        };
+                        let selected = line.index == self.cursor && !self.file_focus;
+                        gutters.push(Line::styled(
+                            format!(
+                                "{} {:>5} {sign} ",
+                                if selected { "›" } else { " " },
+                                line.index + 1
+                            ),
+                            Style::default().fg(color).bg(if selected {
+                                Color::Rgb(42, 61, 78)
+                            } else {
+                                BG
+                            }),
+                        ));
+                        let tokens = colors
+                            .and_then(|c| c.current.get(line.index))
+                            .and_then(|t| t.as_ref());
+                        let spans = tokens.cloned().unwrap_or_else(|| {
+                            vec![Span::styled(line.text.clone(), Style::default().fg(FG))]
+                        });
+                        contents.push(Line::from(spans).style(Style::default().bg(bg)));
+                    }
+                    frame.render_widget(Paragraph::new(gutters), panes[0]);
+                    frame.render_widget(Paragraph::new(contents).scroll((0, self.x)), panes[1]);
+                }
+            } else if self.view == View::Split {
                 let panes = Layout::default()
                     .direction(Direction::Horizontal)
                     .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -555,14 +846,15 @@ impl App {
         }
         let footer = if self.status.is_empty() {
             format!(
-                " {}/{} · row {} · Tab focus · n/p hunk · v view · f files · ? help · q quit",
+                " {}/{} · line {} · {} · + new ~ changed - deleted · Enter previous · v view · ? help · q quit",
                 if self.files.is_empty() {
                     0
                 } else {
                     self.selected + 1
                 },
                 self.files.len(),
-                self.top + 1
+                self.cursor + 1,
+                if self.opts.auto_refresh { "live" } else { "r refresh" }
             )
         } else {
             format!(" {} · ? help · q quit", safe_name(&self.status))
@@ -573,7 +865,41 @@ impl App {
         );
         if let Some(setup) = &mut self.setup {
             setup.draw(frame);
-        } else if self.update_offer.is_some() && self.picker.is_none() && !self.help {
+        } else if let Some(previous) = &self.previous {
+            let popup = centered(area, 100, 28);
+            frame.render_widget(Clear, popup);
+            let block = Block::bordered()
+                .title(" Previous code ")
+                .style(Style::default().bg(BG).fg(FG));
+            let inner = block.inner(popup);
+            frame.render_widget(block, popup);
+            let parts = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+            if previous.lines.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("These lines are new. There is no previous code."),
+                    parts[0],
+                );
+            } else {
+                let colors = self.highlights.get(self.selected);
+                let lines: Vec<_> = previous
+                    .lines
+                    .iter()
+                    .skip(previous.top)
+                    .take(parts[0].height as usize)
+                    .map(|line| code_line(Some(line), 0, true, colors))
+                    .collect();
+                frame.render_widget(Paragraph::new(lines).scroll((0, previous.x)), parts[0]);
+            }
+            frame.render_widget(
+                Paragraph::new("↑↓ scroll · ←→ pan · Esc / Enter / click closes")
+                    .style(Style::default().fg(MUTED)),
+                parts[1],
+            );
+        } else if self.update_offer.is_some()
+            && self.picker.is_none()
+            && !self.help
+            && self.previous.is_none()
+        {
             let release = self.update_offer.as_ref().unwrap();
             let popup = centered(area, 68, 9);
             if popup.height >= 8 {
@@ -595,7 +921,7 @@ impl App {
         } else if self.help {
             let popup = centered(area, 74, 22);
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new("Mouse\n  Click files to select; double-click to expand the diff\n  Wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan horizontally\n  Tab / Enter    Switch focus / focus diff\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Toggle split view / file sidebar\n  s / r          Toggle staged changes / refresh\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
+            frame.render_widget(Paragraph::new("Mouse\n  Click files to select; click changed lines for previous code\n  Wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan horizontally\n  Tab / Enter    Switch focus / inspect previous code\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Cycle current/unified/split / sidebar\n  s / r          Toggle staged changes / refresh\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
                 .block(Block::bordered().title(" Shortcuts ")).style(Style::default().bg(BG).fg(FG)), popup);
         } else if let Some(query) = &self.picker {
             let popup = centered(area, 70, 18);
@@ -685,7 +1011,7 @@ fn code_line(
     Line::from(spans).style(Style::default().bg(bg))
 }
 
-pub fn run(opts: Options, patch: String) -> io::Result<()> {
+pub fn run(opts: Options, snapshot: Snapshot) -> io::Result<()> {
     let mut terminal = ratatui::try_init()?;
     let _cleanup = Cleanup;
     let old_hook = std::panic::take_hook();
@@ -705,12 +1031,15 @@ pub fn run(opts: Options, patch: String) -> io::Result<()> {
                 | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
         )
     )?;
-    let mut app = App::new(opts, &patch);
+    let mut app = App::new(opts, snapshot);
     let mut dirty = true;
     loop {
         if dirty {
             terminal.draw(|frame| app.draw(frame))?;
             dirty = false;
+        }
+        if app.refresh_tick() {
+            dirty = true;
         }
         // First paint always precedes the first syntax request. Neither sending
         // requests nor collecting colors waits for the background worker.
@@ -731,7 +1060,7 @@ pub fn run(opts: Options, patch: String) -> io::Result<()> {
         if dirty {
             continue;
         }
-        if (app.highlights.is_enabled() || app.updater.is_busy())
+        if (app.highlights.is_enabled() || app.updater.is_busy() || app.refresher.is_active())
             && !event::poll(Duration::from_millis(32))?
         {
             continue;
@@ -757,9 +1086,75 @@ pub fn run(opts: Options, patch: String) -> io::Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn background_refresh_preserves_selection_and_viewport_and_defers_previews() {
+        let patch = format!(
+            "diff --git a/code.rs b/code.rs\n--- a/code.rs\n+++ b/code.rs\n@@ -1,40 +1,40 @@\n{}",
+            (0..40).map(|n| format!(" line {n}\n")).collect::<String>()
+        );
+        let mut app = App::new(Options::default(), Snapshot::from_patch(&patch));
+        app.viewport = 10;
+        app.top = 15;
+        app.cursor = 18;
+        app.x = 8;
+        let new_patch = format!("{}{}", diff::DEMO, patch);
+        app.previous = Some(Previous {
+            lines: vec![],
+            top: 0,
+            x: 0,
+        });
+        app.pending_snapshot = Some(Snapshot::from_patch(&new_patch));
+        assert!(!app.refresh_tick());
+        assert_eq!(app.files.len(), 1);
+        app.previous = None;
+        assert!(app.refresh_tick());
+        assert_eq!(app.files[app.selected].name, "code.rs");
+        assert_eq!((app.top, app.cursor, app.x), (15, 18, 8));
+    }
+    #[test]
+    fn current_view_hides_old_code_and_opens_previous_with_keyboard_and_mouse() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(Options::default(), Snapshot::from_patch(diff::DEMO));
+        assert!(app.view == View::Current);
+        let mut terminal = Terminal::new(TestBackend::new(140, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("let name = name.trim()"));
+        assert!(!screen.contains("format!(\"Hello, {}\", name)"));
+        app.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app
+            .previous
+            .as_ref()
+            .unwrap()
+            .lines
+            .iter()
+            .any(|l| l.text.contains("Hello, {}")));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.previous.is_none());
+        app.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            row: app.body_area.y + 1,
+            column: app.body_area.x + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.previous.is_some());
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        for expected in [View::Unified, View::Split, View::Current] {
+            app.key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE));
+            assert!(app.view == expected);
+        }
+    }
+    #[test]
     fn update_prompt_requires_explicit_consent_and_defers_while_typing() {
         use ratatui::{backend::TestBackend, Terminal};
-        let mut app = App::new(Options::default(), diff::DEMO);
+        let mut app = App::new(Options::default(), Snapshot::from_patch(diff::DEMO));
         let release = Release {
             tag: "v0.3.0".into(),
             asset: "tdv-test.tar.gz".into(),
@@ -794,7 +1189,7 @@ mod tests {
     }
     #[test]
     fn shortcuts_picker_and_bounds() {
-        let mut app = App::new(Options::default(), diff::DEMO);
+        let mut app = App::new(Options::default(), Snapshot::from_patch(diff::DEMO));
         app.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         assert_eq!(app.selected, 1);
         app.select(100);
@@ -811,7 +1206,7 @@ mod tests {
     #[test]
     fn double_shift_and_mouse_navigation() {
         use ratatui::{backend::TestBackend, Terminal};
-        let mut app = App::new(Options::default(), diff::DEMO);
+        let mut app = App::new(Options::default(), Snapshot::from_patch(diff::DEMO));
         let shift = KeyEvent::new(
             KeyCode::Modifier(ModifierKeyCode::LeftShift),
             KeyModifiers::SHIFT,
@@ -844,7 +1239,7 @@ mod tests {
     #[test]
     fn render_small_and_normal_terminals() {
         use ratatui::{backend::TestBackend, Terminal};
-        let mut app = App::new(Options::default(), diff::DEMO);
+        let mut app = App::new(Options::default(), Snapshot::from_patch(diff::DEMO));
         for (w, h) in [(10, 3), (30, 6), (80, 24), (160, 40)] {
             let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
             terminal.draw(|frame| app.draw(frame)).unwrap();
