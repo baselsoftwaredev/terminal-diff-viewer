@@ -1,6 +1,6 @@
 [package]
 name = "terminal-diff-viewer"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 rust-version = "1.88"
 description = "A portable, mouse-friendly terminal Git diff viewer"
