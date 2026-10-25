@@ -3,6 +3,7 @@ mod diff;
 mod file_tree;
 mod highlight;
 mod refresh;
+mod search;
 mod setup;
 mod ui;
 mod update;
@@ -20,6 +21,7 @@ struct Options {
     base: Option<String>,
     paths: Vec<String>,
     demo: bool,
+    all_files: bool,
     plain: bool,
     no_mouse: bool,
     icons: bool,
@@ -42,6 +44,7 @@ const HELP: &str = "tdv — terminal Git diff viewer
 Usage: tdv [OPTIONS] [-- PATH...]
 
   --repo DIRECTORY   Repository to view (default: current directory)
+  --all-files        Start with the full repository file explorer
   --staged           Show staged changes instead of unstaged changes
   --base REVISION    Compare against a revision (e.g. HEAD or main)
   --demo             Explore sample changes without a repository
@@ -60,6 +63,7 @@ Usage: tdv [OPTIONS] [-- PATH...]
 
 Keys: arrows / hjkl navigate, Tab focus, [ / ] files, n / p hunks,
       v current/unified/split, Enter previous code, f sidebar, / or Ctrl+P picker,
+      e changed/all files, Ctrl+F find text, F3/Shift+F3 next/previous match,
       r refresh, Shift+R reload config,
       s staged/unstaged, ? help, q quit. Double-click a file to expand.
       Double-Shift opens the picker on terminals with enhanced key reporting.
@@ -99,6 +103,7 @@ fn options() -> io::Result<Option<Options>> {
                 )
             }
             "--staged" => opts.staged = true,
+            "--all-files" => opts.all_files = true,
             "--demo" => opts.demo = true,
             "--plain" => opts.plain = true,
             "--no-mouse" => opts.no_mouse = true,
@@ -176,7 +181,10 @@ fn run() -> io::Result<()> {
     opts.icons = opts.icon_override.unwrap_or(config.ui.icons);
     opts.check_updates = !opts.no_update_check && config.updates.check_on_startup;
     opts.auto_refresh = !opts.no_auto_refresh && config.refresh.auto && !opts.demo;
-    let snapshot = opts.snapshot()?;
+    let mut snapshot = opts.snapshot()?;
+    if !opts.demo {
+        diff::add_repository_files(&mut snapshot, &opts.repo, opts.staged, &opts.paths)?;
+    }
     ui::run(opts, snapshot)
 }
 

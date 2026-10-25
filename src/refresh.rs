@@ -30,9 +30,12 @@ impl Parameters {
         } else {
             diff::load(&self.repo, self.staged, self.base.as_deref(), &self.paths)?
         };
-        // No filesystem or Git reads are needed when the UI accepts this snapshot.
+        // Changed previews are hydrated here; unchanged catalog entries remain lazy.
         for file in &mut snapshot.files {
             file.load_current();
+        }
+        if !self.demo {
+            diff::add_repository_files(&mut snapshot, &self.repo, self.staged, &self.paths)?;
         }
         Ok(snapshot)
     }

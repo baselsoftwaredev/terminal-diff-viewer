@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ffi::OsString,
     fs,
     io::{self, Read},
@@ -32,6 +33,7 @@ pub struct FileDiff {
     pub note: Option<String>,
     pub is_new: bool,
     pub is_deleted: bool,
+    pub unchanged: bool,
     loaded: bool,
     source: Source,
 }
@@ -459,6 +461,61 @@ pub fn load(
     Ok(Snapshot { patch, files })
 }
 
+/// Add lazy previews for tracked and non-ignored untracked files. Changed files
+/// keep their patch/index semantics; plain patch loading never calls this.
+pub fn add_repository_files(
+    snapshot: &mut Snapshot,
+    repo: &Path,
+    staged: bool,
+    paths: &[String],
+) -> io::Result<()> {
+    let root = repository_root(repo)?;
+    let mut command = Command::new("git");
+    command
+        .current_dir(if paths.is_empty() { &root } else { repo })
+        .args(["ls-files", "--cached", "--full-name", "-z"]);
+    if !staged {
+        command.args(["--others", "--exclude-standard"]);
+    }
+    let output = command.arg("--").args(paths).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other("cannot list repository files"));
+    }
+    let mut seen: HashSet<String> = snapshot.files.iter().map(|f| f.name.clone()).collect();
+    for path in git_paths(&output.stdout) {
+        let name = path.to_string_lossy().into_owned();
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let full = root.join(&path);
+        if !staged
+            && !fs::symlink_metadata(&full).is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+        {
+            continue;
+        }
+        if staged {
+            // Gitlinks are directories, not text files. Avoid a recursive index preview.
+            if fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) {
+                continue;
+            }
+        }
+        snapshot.files.push(FileDiff {
+            name,
+            unchanged: true,
+            source: if staged {
+                Source::Index {
+                    root: root.clone(),
+                    path,
+                }
+            } else {
+                Source::Worktree(full)
+            },
+            ..FileDiff::default()
+        });
+    }
+    Ok(())
+}
+
 fn safe_text(text: &str) -> String {
     text.chars()
         .map(|c| {
@@ -609,6 +666,106 @@ mod tests {
         git(root.path(), &["init", "--quiet"]);
         root
     }
+    #[test]
+    fn repository_catalog_keeps_clean_files_lazy_and_obeys_source_filters_and_ignores() {
+        let root = repository();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/clean file.rs"), "clean contents\n").unwrap();
+        fs::write(root.path().join("src/binary.bin"), b"image\0bytes").unwrap();
+        fs::write(root.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        git(root.path(), &["add", "."]);
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--quiet",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(root.path().join("ignored.txt"), "private").unwrap();
+        let before = git(root.path(), &["ls-files", "--stage", "-z"]);
+        let mut snapshot = load(root.path(), false, None, &[]).unwrap();
+        assert!(snapshot.files.is_empty());
+        add_repository_files(&mut snapshot, root.path(), false, &[]).unwrap();
+        assert_eq!(snapshot.files.len(), 3);
+        assert!(snapshot
+            .files
+            .iter()
+            .all(|f| f.unchanged && !f.loaded && f.current.is_empty()));
+        let clean = snapshot
+            .files
+            .iter_mut()
+            .find(|f| f.name == "src/clean file.rs")
+            .unwrap();
+        clean.load_current();
+        assert_eq!(clean.current[0].text, "clean contents");
+        assert!(clean.changes.is_empty());
+        let binary = snapshot
+            .files
+            .iter_mut()
+            .find(|f| f.name.ends_with("binary.bin"))
+            .unwrap();
+        binary.load_current();
+        assert!(binary.note.as_deref().unwrap().contains("Binary"));
+        fs::write(root.path().join("src/clean file.rs"), "unstaged contents\n").unwrap();
+        fs::write(root.path().join("new.txt"), "untracked\n").unwrap();
+        let mut staged = load(root.path(), true, None, &[]).unwrap();
+        add_repository_files(&mut staged, root.path(), true, &[]).unwrap();
+        assert!(!staged.files.iter().any(|f| f.name == "new.txt"));
+        let index = staged
+            .files
+            .iter_mut()
+            .find(|f| f.name == "src/clean file.rs")
+            .unwrap();
+        index.load_current();
+        assert_eq!(index.current[0].text, "clean contents");
+        let mut working = load(root.path(), false, None, &[]).unwrap();
+        let patch = working.patch.clone();
+        add_repository_files(&mut working, root.path(), false, &[]).unwrap();
+        assert_eq!(working.patch, patch);
+        assert_eq!(
+            working
+                .files
+                .iter()
+                .filter(|f| f.name == "src/clean file.rs")
+                .count(),
+            1
+        );
+        assert!(
+            !working
+                .files
+                .iter()
+                .find(|f| f.name == "src/clean file.rs")
+                .unwrap()
+                .unchanged
+        );
+        assert!(working.files.iter().any(|f| f.name == "new.txt"));
+        let mut filtered = load(
+            &root.path().join("src"),
+            false,
+            None,
+            &["binary.bin".into()],
+        )
+        .unwrap();
+        add_repository_files(
+            &mut filtered,
+            &root.path().join("src"),
+            false,
+            &["binary.bin".into()],
+        )
+        .unwrap();
+        assert_eq!(filtered.files.len(), 1);
+        assert_eq!(filtered.files[0].name, "src/binary.bin");
+        assert_eq!(before, git(root.path(), &["ls-files", "--stage", "-z"]));
+    }
+
     #[test]
     fn new_files_respect_ignores_filters_and_leave_index_untouched() {
         let root = repository();

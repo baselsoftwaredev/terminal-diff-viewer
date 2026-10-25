@@ -3,6 +3,7 @@ use crate::{
     file_tree::{self, Row as FileRow},
     highlight::{Colors, Highlighter},
     refresh::{Parameters, Refresher},
+    search,
     setup::{Action as SetupAction, Setup},
     update::{Message, Release, Updater},
     Options,
@@ -104,8 +105,16 @@ struct App {
     scrollbar: Rect,
     screen_width: u16,
     drag: Option<Drag>,
+    all_files: bool,
     picker: Option<String>,
+    finding: bool,
+    search_query: String,
+    search_hits: Vec<(usize, usize)>,
+    search_pick: usize,
+    picker_area: Rect,
+    picker_start: usize,
     pick: usize,
+    picker_matches: Vec<usize>,
     help: bool,
     status: String,
     list_area: Rect,
@@ -121,11 +130,12 @@ impl App {
         let updater = Updater::new(opts.check_updates);
         let setup = opts.setup.take();
         let status = std::mem::take(&mut opts.startup_notice);
+        let all_files = opts.all_files;
         let mut files: Vec<Arc<FileDiff>> = snapshot.files.into_iter().map(Arc::new).collect();
-        if let Some(file) = files.first_mut() {
+        if let Some(file) = files.first_mut().filter(|f| all_files || !f.unchanged) {
             Arc::make_mut(file).load_current();
         }
-        let tree = file_tree::rows(files.iter().map(|f| f.name.as_str()), &HashSet::new());
+        let tree = sidebar_rows(&files, all_files, &HashSet::new());
         let tree_cursor = tree.iter().position(|r| r.file == Some(0)).unwrap_or(0);
         Self {
             setup,
@@ -156,8 +166,16 @@ impl App {
             scrollbar: Rect::default(),
             screen_width: 0,
             drag: None,
+            all_files,
             picker: None,
+            finding: false,
+            search_query: String::new(),
+            search_hits: Vec::new(),
+            search_pick: 0,
+            picker_area: Rect::default(),
+            picker_start: 0,
             pick: 0,
+            picker_matches: Vec::new(),
             help: false,
             status,
             list_area: Rect::default(),
@@ -173,7 +191,19 @@ impl App {
         self.selected = n.min(self.files.len().saturating_sub(1));
         self.top = 0;
         self.x = 0;
+        if self.files.get(self.selected).is_some_and(|f| f.unchanged) {
+            if !self.all_files {
+                self.all_files = true;
+                self.rebuild_tree();
+            }
+            self.view = View::Current;
+        }
         self.reveal_selected();
+        self.search_query.clear();
+        self.search_hits.clear();
+        if self.status.starts_with("Find:") {
+            self.status.clear();
+        }
         self.cursor = 0;
         self.previous = None;
         if let Some(file) = self.files.get_mut(self.selected) {
@@ -182,7 +212,7 @@ impl App {
     }
 
     fn rebuild_tree(&mut self) {
-        self.tree = file_tree::rows(self.files.iter().map(|f| f.name.as_str()), &self.collapsed);
+        self.tree = sidebar_rows(&self.files, self.all_files, &self.collapsed);
         self.tree_cursor = self.tree_cursor.min(self.tree.len().saturating_sub(1));
         self.clamp_tree_scroll();
     }
@@ -334,16 +364,23 @@ impl App {
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
         let tree_path = self.tree.get(self.tree_cursor).map(|r| r.path.clone());
         let name = self.files.get(self.selected).map(|f| f.name.clone());
+        let eligible = |file: &FileDiff| self.all_files || !file.unchanged;
         let selected = snapshot
             .files
             .iter()
-            .position(|f| Some(&f.name) == name.as_ref())
-            .unwrap_or(self.selected.min(snapshot.files.len().saturating_sub(1)));
+            .position(|f| eligible(f) && Some(&f.name) == name.as_ref())
+            .or_else(|| snapshot.files.iter().position(eligible))
+            .unwrap_or(0);
         self.highlights.invalidate();
         self.files = snapshot.files.into_iter().map(Arc::new).collect();
         self.selected = selected;
         if let Some(file) = self.files.get_mut(selected) {
-            Arc::make_mut(file).load_current();
+            if self.all_files || !file.unchanged {
+                Arc::make_mut(file).load_current();
+            }
+            if file.unchanged {
+                self.view = View::Current;
+            }
         }
         self.rebuild_tree();
         self.tree_cursor = self
@@ -357,6 +394,19 @@ impl App {
             .cursor
             .min(self.row_count().saturating_sub(1))
             .max(self.top);
+        self.update_search();
+        if !self.search_query.is_empty() {
+            self.status = format!(
+                "Find: {} · {}/{} · F3 next · Shift+F3 previous",
+                self.search_query,
+                if self.search_hits.is_empty() {
+                    0
+                } else {
+                    self.search_pick + 1
+                },
+                self.search_hits.len()
+            );
+        }
         if self.manual_refresh || self.status.starts_with("Refresh failed:") {
             self.status = "Refreshed".into();
         }
@@ -381,7 +431,7 @@ impl App {
                 }
             }
         }
-        if self.previous.is_none() && self.picker.is_none() {
+        if self.previous.is_none() && self.picker.is_none() && !self.finding {
             if let Some(snapshot) = self.pending_snapshot.take() {
                 self.apply_snapshot(snapshot);
                 changed = true;
@@ -400,6 +450,9 @@ impl App {
     }
 
     fn row_count(&self) -> usize {
+        if !self.has_selection() {
+            return 0;
+        }
         self.files
             .get(self.selected)
             .map(|file| {
@@ -476,19 +529,129 @@ impl App {
         }
     }
 
-    fn matches(&self) -> Vec<usize> {
-        let query = self.picker.as_deref().unwrap_or("").to_lowercase();
-        self.files
+    fn toggle_explorer(&mut self) {
+        self.all_files = !self.all_files;
+        self.rebuild_tree();
+        self.sidebar = true;
+        self.file_focus = true;
+        if let Some(index) = self
+            .files
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.name.to_lowercase().contains(&query))
+            .find(|(index, f)| *index == self.selected && (self.all_files || !f.unchanged))
             .map(|(i, _)| i)
-            .collect()
+            .or_else(|| {
+                self.files
+                    .iter()
+                    .position(|f| self.all_files || !f.unchanged)
+            })
+        {
+            self.select(index);
+        } else {
+            self.rebuild_tree();
+        }
+    }
+
+    fn step_file(&mut self, forward: bool) {
+        let indices: Vec<_> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter(|(_, file)| self.all_files || !file.unchanged)
+            .map(|(i, _)| i)
+            .collect();
+        if let Some(position) = indices.iter().position(|i| *i == self.selected) {
+            let next = if forward {
+                (position + 1).min(indices.len() - 1)
+            } else {
+                position.saturating_sub(1)
+            };
+            self.select(indices[next]);
+        }
+    }
+
+    fn has_selection(&self) -> bool {
+        self.files
+            .get(self.selected)
+            .is_some_and(|f| self.all_files || !f.unchanged)
+    }
+
+    fn matches(&self) -> &[usize] {
+        &self.picker_matches
+    }
+
+    fn filter_picker(&mut self) {
+        let query = self.picker.as_deref().unwrap_or("");
+        let mut matches: Vec<_> = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(index, f)| {
+                search::fuzzy_score(&f.name, query).map(|score| (index, score))
+            })
+            .collect();
+        matches.sort_by(|(a, sa), (b, sb)| {
+            sb.cmp(sa)
+                .then_with(|| self.files[*a].name.cmp(&self.files[*b].name))
+        });
+        self.picker_matches = matches.into_iter().map(|(index, _)| index).collect();
+    }
+
+    fn update_search(&mut self) {
+        self.search_hits = self
+            .files
+            .get(self.selected)
+            .map(|file| {
+                search::occurrences(
+                    file.current.iter().map(|line| line.text.as_str()),
+                    &self.search_query,
+                )
+            })
+            .unwrap_or_default();
+        self.search_pick = self
+            .search_pick
+            .min(self.search_hits.len().saturating_sub(1));
+    }
+
+    fn jump_search(&mut self) {
+        if let Some(&(row, column)) = self.search_hits.get(self.search_pick) {
+            self.cursor = row;
+            self.top = row.saturating_sub(self.viewport / 2);
+            self.clamp();
+            let column = Line::raw(&self.files[self.selected].current[row].text[..column]).width();
+            self.x = column.saturating_sub(10).min(usize::from(u16::MAX)) as u16;
+        }
+        self.status = if self.search_query.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "Find: {} · {}/{} · F3 next · Shift+F3 previous",
+                self.search_query,
+                if self.search_hits.is_empty() {
+                    0
+                } else {
+                    self.search_pick + 1
+                },
+                self.search_hits.len()
+            )
+        };
+    }
+
+    fn next_match(&mut self, forward: bool) {
+        if !self.search_hits.is_empty() {
+            self.search_pick = if forward {
+                (self.search_pick + 1) % self.search_hits.len()
+            } else {
+                (self.search_pick + self.search_hits.len() - 1) % self.search_hits.len()
+            };
+        }
+        self.jump_search();
     }
 
     fn open_picker(&mut self) {
         self.picker = Some(String::new());
         self.pick = 0;
+        self.filter_picker();
     }
 
     fn receive_update(&mut self, message: Message) {
@@ -570,6 +733,7 @@ impl App {
         // Defer the prompt while the user is typing in a picker or reading help.
         if self.update_offer.is_some()
             && self.picker.is_none()
+            && !self.finding
             && !self.help
             && self.previous.is_none()
         {
@@ -595,7 +759,8 @@ impl App {
             key.code,
             KeyCode::Modifier(ModifierKeyCode::LeftShift | ModifierKeyCode::RightShift)
         ) {
-            if key.kind != KeyEventKind::Press {
+            if self.finding || self.picker.is_some() || self.help || key.kind != KeyEventKind::Press
+            {
                 return false;
             }
             let now = Instant::now();
@@ -615,6 +780,39 @@ impl App {
             self.help = false;
             return false;
         }
+        if self.finding {
+            match key.code {
+                KeyCode::Esc => {
+                    self.finding = false;
+                    self.search_query.clear();
+                    self.search_hits.clear();
+                    self.status.clear();
+                }
+                KeyCode::Enter => {
+                    self.finding = false;
+                    self.jump_search();
+                }
+                KeyCode::Backspace => {
+                    self.search_query.pop();
+                    self.search_pick = 0;
+                    self.update_search();
+                    self.jump_search();
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    self.search_query.push(c);
+                    self.search_pick = 0;
+                    self.update_search();
+                    self.jump_search();
+                }
+                KeyCode::F(3) => self.next_match(!key.modifiers.contains(KeyModifiers::SHIFT)),
+                _ => {}
+            }
+            return false;
+        }
         if self.picker.is_some() {
             match key.code {
                 KeyCode::Esc => self.picker = None,
@@ -632,6 +830,7 @@ impl App {
                 KeyCode::Backspace => {
                     self.picker.as_mut().unwrap().pop();
                     self.pick = 0;
+                    self.filter_picker();
                 }
                 KeyCode::Char(c)
                     if !key
@@ -640,17 +839,37 @@ impl App {
                 {
                     self.picker.as_mut().unwrap().push(c);
                     self.pick = 0;
+                    self.filter_picker();
                 }
                 _ => {}
             }
             return false;
         }
         match key.code {
+            KeyCode::Esc if !self.search_query.is_empty() => {
+                self.search_query.clear();
+                self.search_hits.clear();
+                self.status.clear();
+            }
             KeyCode::Char('q') | KeyCode::Esc => return true,
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_picker()
             }
             KeyCode::Char('/') => self.open_picker(),
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if self.has_selection() {
+                    self.view = View::Current;
+                    self.clamp();
+                    self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
+                    self.file_focus = false;
+                    self.finding = true;
+                    self.search_query.clear();
+                    self.search_hits.clear();
+                    self.search_pick = 0;
+                }
+            }
+            KeyCode::F(3) => self.next_match(!key.modifiers.contains(KeyModifiers::SHIFT)),
+            KeyCode::Char('e') => self.toggle_explorer(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Tab | KeyCode::BackTab => {
                 self.file_focus = !self.file_focus;
@@ -659,6 +878,10 @@ impl App {
             KeyCode::Char('f') => {
                 self.sidebar = !self.sidebar;
                 self.file_focus = false;
+            }
+            KeyCode::Char('v') if self.files.get(self.selected).is_some_and(|f| f.unchanged) => {
+                self.view = View::Current;
+                self.status = "This file has no Git changes in the selected source. Showing its full contents.".into();
             }
             KeyCode::Char('v') => {
                 self.view = self.view.next();
@@ -671,8 +894,8 @@ impl App {
             }
             KeyCode::Char('r') => self.reload(),
             KeyCode::Char('R') => self.reload_config(),
-            KeyCode::Char(']') => self.select(self.selected.saturating_add(1)),
-            KeyCode::Char('[') => self.select(self.selected.saturating_sub(1)),
+            KeyCode::Char(']') => self.step_file(true),
+            KeyCode::Char('[') => self.step_file(false),
             KeyCode::Char('n') => self.hunk(true),
             KeyCode::Char('p') => self.hunk(false),
             KeyCode::Enter => {
@@ -773,6 +996,7 @@ impl App {
         }
         if self.update_offer.is_some()
             && self.picker.is_none()
+            && !self.finding
             && !self.help
             && self.previous.is_none()
         {
@@ -786,7 +1010,27 @@ impl App {
             }
             return;
         }
-        if self.help || self.picker.is_some() {
+        if self.picker.is_some() {
+            match event.kind {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.picker_area.contains((event.column, event.row).into()) =>
+                {
+                    let index = self.picker_start + usize::from(event.row - self.picker_area.y);
+                    if let Some(file) = self.matches().get(index).copied() {
+                        self.select(file);
+                        self.file_focus = false;
+                        self.picker = None;
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    self.pick = (self.pick + 1).min(self.matches().len().saturating_sub(1))
+                }
+                MouseEventKind::ScrollUp => self.pick = self.pick.saturating_sub(1),
+                _ => {}
+            }
+            return;
+        }
+        if self.help || self.finding {
             return;
         }
         if event.kind == MouseEventKind::Drag(MouseButton::Left) {
@@ -811,9 +1055,11 @@ impl App {
                     self.view = self.view.next();
                     self.cursor = 0;
                     self.top = 0;
-                } else if event.column < 30 {
+                } else if event.column < 28 {
                     self.opts.staged = !self.opts.staged;
                     self.reload();
+                } else if event.column >= 48 {
+                    self.toggle_explorer();
                 } else {
                     self.open_picker();
                 }
@@ -908,6 +1154,7 @@ impl App {
         self.list_area = Rect::default();
         self.sidebar_edge = Rect::default();
         self.scrollbar = Rect::default();
+        self.picker_area = Rect::default();
         frame.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
         if area.width < 30 || area.height < 6 {
             frame.render_widget(Paragraph::new("Resize to at least 30 × 6. q quits."), area);
@@ -927,9 +1174,14 @@ impl App {
         } else {
             "Unstaged"
         };
+        let explorer = if self.all_files {
+            "All files"
+        } else {
+            "Changes"
+        };
         frame.render_widget(
             Paragraph::new(format!(
-                " [v] {mode:<7}  [s] {source:<8}  [Ctrl+P] Find file   tdv"
+                " [v] {mode:<7}  [s] {source:<8}  [Ctrl+P] Find file  [e] {explorer}"
             ))
             .style(Style::default().bg(Color::Rgb(34, 43, 57)).fg(ACCENT)),
             sections[0],
@@ -950,7 +1202,18 @@ impl App {
         if show_sidebar {
             let block = Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Files · {} ", self.files.len()))
+                .title(format!(
+                    " {} · {} ",
+                    if self.all_files {
+                        "All files"
+                    } else {
+                        "Changes"
+                    },
+                    self.files
+                        .iter()
+                        .filter(|f| self.all_files || !f.unchanged)
+                        .count()
+                ))
                 .border_style(Style::default().fg(if self.file_focus { ACCENT } else { MUTED }));
             self.list_area = block.inner(columns[0]);
             self.sidebar_edge = Rect::new(
@@ -1023,6 +1286,7 @@ impl App {
         let title = self
             .files
             .get(self.selected)
+            .filter(|f| self.all_files || !f.unchanged)
             .map(|f| format!(" {} ", safe_name(&f.name)))
             .unwrap_or_else(|| " Changes ".into());
         let block = Block::default()
@@ -1032,11 +1296,13 @@ impl App {
         self.body_area = block.inner(columns[1]);
         frame.render_widget(block, columns[1]);
         self.viewport = self.body_area.height as usize;
-        if self.files.is_empty() {
+        if !self.has_selection() {
             frame.render_widget(
-                Paragraph::new(
-                    "No changes in this view.\nPress s to switch staged/unstaged, or r to refresh.",
-                )
+                Paragraph::new(if self.all_files {
+                    "No repository files in this view.\nPress s to switch staged/unstaged, or r to refresh."
+                } else {
+                    "No changes in this view.\nPress e to browse all files, Ctrl+P to find a file, or s to switch staged/unstaged."
+                })
                 .style(Style::default().fg(MUTED)),
                 self.body_area,
             );
@@ -1093,7 +1359,10 @@ impl App {
                         let spans = tokens.cloned().unwrap_or_else(|| {
                             vec![Span::styled(line.text.clone(), Style::default().fg(FG))]
                         });
-                        contents.push(Line::from(spans).style(Style::default().bg(bg)));
+                        contents.push(
+                            Line::from(highlight_search(spans, &self.search_query))
+                                .style(Style::default().bg(bg)),
+                        );
                     }
                     frame.render_widget(Paragraph::new(gutters), panes[0]);
                     frame.render_widget(Paragraph::new(contents).scroll((0, self.x)), panes[1]);
@@ -1127,12 +1396,8 @@ impl App {
         let footer = if self.status.is_empty() {
             format!(
                 " {}/{} · line {} · {} · + new ~ changed - deleted · Enter previous · v view · ? help · q quit",
-                if self.files.is_empty() {
-                    0
-                } else {
-                    self.selected + 1
-                },
-                self.files.len(),
+                if self.has_selection() { self.files[..=self.selected].iter().filter(|f| self.all_files || !f.unchanged).count() } else { 0 },
+                self.files.iter().filter(|f| self.all_files || !f.unchanged).count(),
                 self.cursor + 1,
                 if self.opts.auto_refresh { "live" } else { "r refresh" }
             )
@@ -1177,6 +1442,7 @@ impl App {
             );
         } else if self.update_offer.is_some()
             && self.picker.is_none()
+            && !self.finding
             && !self.help
             && self.previous.is_none()
         {
@@ -1199,23 +1465,46 @@ impl App {
                 .block(Block::bordered().title(" Update available "))
                 .style(Style::default().bg(BG).fg(FG)), popup);
         } else if self.help {
-            let popup = centered(area, 74, 22);
+            let popup = centered(area, 84, 26);
             frame.render_widget(Clear, popup);
-            frame.render_widget(Paragraph::new("Mouse\n  Click folders to collapse; click files to select\n  Drag the file pane border to resize; drag its scrollbar to scroll\n  Click changed lines for previous code; wheel scrolls; Shift+wheel or horizontal wheel pans\n  Click the top bar to change view, source, or find files\n\nKeyboard\n  ↑↓ / j k       Scroll (or select files when focused)\n  ←→ / h l       Pan code / collapse or expand folders\n  Tab / Enter    Switch focus / inspect previous code\n  [ ]            Previous / next file\n  n p            Next / previous hunk\n  PgUp PgDn      Scroll one page\n  Home End / g G First / last page\n  v / f          Cycle current/unified/split / sidebar\n  s / r          Toggle staged changes / refresh\n  Shift+R        Reload config without restarting\n  Ctrl+P or /    Find file (also double-Shift if supported)\n  q / Ctrl+C     Quit\n\nPress any key to close.")
+            frame.render_widget(Paragraph::new("Mouse\n  Click folders/files; drag the pane border or scrollbar\n  Wheel scrolls; Shift+wheel pans; double-click hides sidebar\n\nKeyboard\n  ↑↓ / j k       Scroll or select files\n  ←→ / h l       Pan code or collapse/expand folders\n  Tab / Enter    Focus / inspect previous code\n  e / f          Changes or All files / show sidebar\n  Ctrl+P or /    Fuzzy find any file (also double-Shift)\n  Ctrl+F         Find text · F3 / Shift+F3 next/previous\n  [ ] / n p      Previous/next file or hunk\n  PgUp PgDn      Page · Home End or g G start/end\n  v / s          Cycle view / staged or unstaged\n  r / Shift+R    Refresh files / reload configuration\n  q / Ctrl+C     Quit · Esc clears search or quits\n\nPress any key to close.")
                 .block(Block::bordered().title(" Shortcuts ")).style(Style::default().bg(BG).fg(FG)), popup);
+        } else if self.finding {
+            frame.render_widget(
+                Paragraph::new(format!(
+                    " Find: {}▏ · {} matches · Enter keep · Esc clear · F3 next",
+                    safe_name(&self.search_query),
+                    self.search_hits.len()
+                ))
+                .style(Style::default().bg(Color::Rgb(34, 43, 57)).fg(ACCENT)),
+                sections[2],
+            );
         } else if let Some(query) = &self.picker {
             let popup = centered(area, 70, 18);
             frame.render_widget(Clear, popup);
             let block = Block::bordered()
-                .title(format!(" Find file: {query}▏ "))
+                .title(format!(" Find any file (fuzzy): {query}▏ "))
                 .border_style(Style::default().fg(ACCENT))
                 .style(Style::default().bg(BG).fg(FG));
+            self.picker_area = block.inner(popup);
+            let height = usize::from(popup.height.saturating_sub(2)).max(1);
+            let start = self.pick.saturating_sub(height - 1);
+            self.picker_start = start;
             let matches = self.matches();
             let items: Vec<ListItem> = matches
                 .iter()
+                .skip(start)
+                .take(height)
                 .map(|i| ListItem::new(safe_name(&self.files[*i].name)))
                 .collect();
-            let mut state = ListState::default().with_selected(Some(self.pick));
+            let mut state = ListState::default().with_selected(Some(self.pick - start));
+            if matches.is_empty() {
+                frame.render_widget(
+                    Paragraph::new("No files match this query.").block(block),
+                    popup,
+                );
+                return;
+            }
             frame.render_stateful_widget(
                 List::new(items)
                     .block(block)
@@ -1226,6 +1515,65 @@ impl App {
             );
         }
     }
+}
+
+fn sidebar_rows(files: &[Arc<FileDiff>], all: bool, collapsed: &HashSet<String>) -> Vec<FileRow> {
+    let indices: Vec<usize> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| all || !file.unchanged)
+        .map(|(i, _)| i)
+        .collect();
+    let mut rows = file_tree::rows(indices.iter().map(|i| files[*i].name.as_str()), collapsed);
+    for row in &mut rows {
+        if let Some(index) = row.file {
+            row.file = Some(indices[index]);
+        }
+    }
+    rows
+}
+
+fn highlight_search(spans: Vec<Span<'static>>, query: &str) -> Vec<Span<'static>> {
+    if query.is_empty() {
+        return spans;
+    }
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    let hits: Vec<_> = text
+        .match_indices(query)
+        .map(|(start, _)| (start, start + query.len()))
+        .collect();
+    let mut result = Vec::new();
+    let mut offset = 0;
+    for span in spans {
+        let end = offset + span.content.len();
+        let mut at = offset;
+        for &(start, stop) in &hits {
+            let start = start.max(offset);
+            let stop = stop.min(end);
+            if start >= stop {
+                continue;
+            }
+            if at < start {
+                result.push(Span::styled(
+                    span.content[at - offset..start - offset].to_owned(),
+                    span.style,
+                ));
+            }
+            result.push(Span::styled(
+                span.content[start - offset..stop - offset].to_owned(),
+                span.style.fg(Color::Black).bg(Color::Yellow),
+            ));
+            at = stop;
+        }
+        if at < end {
+            result.push(Span::styled(
+                span.content[at - offset..].to_owned(),
+                span.style,
+            ));
+        }
+        offset = end;
+    }
+    result
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -1324,7 +1672,11 @@ pub fn run(opts: Options, snapshot: Snapshot) -> io::Result<()> {
         // First paint always precedes the first syntax request. Neither sending
         // requests nor collecting colors waits for the background worker.
         if app.setup.is_none() {
-            if let Some(file) = app.files.get(app.selected) {
+            if let Some(file) = app
+                .files
+                .get(app.selected)
+                .filter(|f| app.all_files || !f.unchanged)
+            {
                 app.highlights.request(app.selected, file);
             }
             app.updater.start_check();
@@ -1541,6 +1893,7 @@ mod tests {
         assert!(app.collapsed.contains("src"));
         app.open_picker();
         app.picker = Some("greeting".into());
+        app.filter_picker();
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(!app.collapsed.contains("src"));
         assert_eq!(app.tree[app.tree_cursor].file, Some(0));
@@ -1654,6 +2007,185 @@ mod tests {
         assert!(!app.opts.icons);
         assert!(app.opts.syntax_languages.is_empty());
         assert!(!app.opts.auto_refresh);
+    }
+
+    fn workspace_sample() -> Snapshot {
+        let mut snapshot = Snapshot::from_patch(diff::DEMO);
+        let mut clean = Snapshot::from_patch("diff --git a/src/LongFileName.rs b/src/LongFileName.rs\n--- a/src/LongFileName.rs\n+++ b/src/LongFileName.rs\n@@ -1,3 +1,3 @@\n é needle needle\n second line\n needle again\n").files.remove(0);
+        clean.unchanged = true;
+        snapshot.files.push(clean);
+        snapshot
+    }
+
+    #[test]
+    fn explorer_picker_opens_unchanged_files_and_diff_navigation_stays_filtered() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = App::new(Options::default(), workspace_sample());
+        assert_eq!(app.tree.iter().filter(|r| r.file.is_some()).count(), 2);
+        app.step_file(true);
+        assert_eq!(app.selected, 1);
+        app.step_file(true);
+        assert_eq!(app.selected, 1);
+        assert!(!app.all_files);
+        // The portable shortcut and double-Shift share the same all-file picker.
+        app.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        for c in "lfn rs".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.matches(), [2]);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.all_files);
+        assert_eq!(app.tree.iter().filter(|r| r.file.is_some()).count(), 3);
+        assert_eq!(app.selected, 2);
+        assert!(app.view == View::Current);
+        assert_eq!(app.files[2].current[1].text, "second line");
+        assert!(app.files[2].changes.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE));
+        assert!(!app.all_files);
+        assert!(!app.files[app.selected].unchanged);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 49,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.all_files);
+        app.open_picker();
+        for c in "no-such-file".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app.matches().is_empty());
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("No files match"));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.open_picker();
+        for c in "lfn".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        app.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: app.picker_area.x,
+            row: app.picker_area.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.selected, 2);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn newly_changed_file_replaces_hidden_clean_selection_after_refresh() {
+        let mut sample = workspace_sample();
+        let clean = sample.files.pop().unwrap();
+        let mut app = App::new(
+            Options::default(),
+            Snapshot {
+                patch: String::new(),
+                files: vec![clean],
+            },
+        );
+        assert!(!app.has_selection());
+        app.apply_snapshot(workspace_sample());
+        assert!(app.has_selection());
+        assert!(!app.files[app.selected].unchanged);
+        assert!(!app.all_files);
+    }
+
+    #[test]
+    fn clean_repository_explorer_has_lazy_preview_and_search_wraps_each_match() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut sample = workspace_sample();
+        let clean = sample.files.pop().unwrap();
+        let mut app = App::new(
+            Options::default(),
+            Snapshot {
+                patch: String::new(),
+                files: vec![clean],
+            },
+        );
+        assert!(!app.has_selection());
+        assert!(app.tree.is_empty());
+        assert!(app.files[0].current.is_empty());
+        app.toggle_explorer();
+        assert!(app.has_selection());
+        assert_eq!(app.tree.iter().filter(|r| r.file.is_some()).count(), 1);
+        assert_eq!(app.files[0].current.len(), 3);
+        app.viewport = 2;
+        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        for c in "needle".chars() {
+            assert!(!app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
+        }
+        assert_eq!(app.search_hits, [(0, 3), (0, 10), (2, 0)]);
+        assert_eq!(app.cursor, 0);
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!app.finding);
+        app.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(app.search_pick, 1);
+        app.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(app.cursor, 2);
+        app.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert_eq!(app.search_pick, 0);
+        app.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT));
+        assert_eq!(app.search_pick, 2);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        assert!(terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|c| c.bg == Color::Yellow));
+        assert!(!app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(app.search_hits.is_empty());
+        assert!(app.search_query.is_empty());
+        app.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL));
+        for c in "missing".chars() {
+            app.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert!(app.search_hits.is_empty());
+        app.key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE));
+        assert!(app.status.contains("0/0"));
+        // A pending refresh cannot replace the file while search text is being entered.
+        app.pending_snapshot = Some(Snapshot::from_patch(diff::DEMO));
+        assert!(!app.refresh_tick());
+        assert_eq!(app.files.len(), 1);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.refresh_tick());
+        assert!(app.search_hits.is_empty());
+    }
+
+    #[test]
+    fn search_highlighting_crosses_syntax_spans_and_preserves_unicode() {
+        let spans = vec![
+            Span::raw("é ne"),
+            Span::styled("edle", Style::default().fg(Color::Cyan)),
+            Span::raw(" end"),
+        ];
+        let result = highlight_search(spans, "needle");
+        assert_eq!(
+            result
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "é needle end"
+        );
+        assert_eq!(
+            result
+                .iter()
+                .filter(|s| s.style.bg == Some(Color::Yellow))
+                .map(|s| s.content.as_ref())
+                .collect::<String>(),
+            "needle"
+        );
     }
 
     #[test]

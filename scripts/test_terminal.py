@@ -97,7 +97,9 @@ def main():
         original = ''.join('unchanged line %s\n' % n for n in range(1, 41))
         code = root / 'code.rs'
         code.write_text(original)
-        git('add', 'code.rs')
+        clean = root / 'LongFileName.rs'
+        clean.write_text('CLEAN_START\n' + ''.join(f'clean context {i}\n' for i in range(40)) + 'FIND_TARGET\nFIND_TARGET\nCLEAN_END\n')
+        git('add', 'code.rs', 'LongFileName.rs')
         git('-c', 'user.name=Test', '-c', 'user.email=test@example.com', '-c', 'commit.gpgsign=false', 'commit', '--quiet', '-m', 'initial')
         code.write_text(original.replace('unchanged line 20', 'CURRENT VERSION A'))
         screen = Screen()
@@ -189,10 +191,38 @@ def main():
             wait_for('[v] Unified')
             send(b'v')
             wait_for('[v] Split')
+            mouse(0, 50, 1)
+            mouse(0, 50, 1, release=True)
+            wait_for('[e] All files')
+            # Enhanced terminals send standalone Shift keys through Kitty reporting.
+            send(b'\x1b[57441u\x1b[57441u')
+            wait_for('Find any file (fuzzy)')
+            send(b'lfn rs\r')
+            wait_for('CLEAN_START')
+            wait_for('[v] Current')
+            send(b'\x06FIND_TARGET\r')
+            wait_for('1/2')
+            wait_for('FIND_TARGET')
+            send(b'\x1bOR')  # F3
+            wait_for('2/2')
+            send(b'\x1b[13;2~')  # Shift+F3 (avoid the cursor-position-report sequence)
+            wait_for('1/2')
+            send(b'\x1b')  # Clear retained search, keeping the viewer open.
+            wait_for('F3 next', present=False)
+            send(b'e')
+            wait_for('[e] Changes')
+            wait_for('brand_new_code')
             send(b'q')
-            proc.wait(timeout=3)
+            # Keep draining output until exit; a full PTY buffer can block the
+            # final frame/alternate-screen cleanup even after q was received.
+            deadline = time.monotonic() + 5
+            while proc.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], .03)[0]:
+                    try: screen.feed(os.read(master, 65536))
+                    except OSError: break
+            proc.wait(timeout=1)
             assert proc.returncode == 0
-            print('PASS: full current file, previous-code popup, repeated live edits, new files, staging, all three views, folder clicks, sidebar resizing, scrollbar dragging, and live configuration reload.')
+            print('PASS: full current file, previous-code popup, repeated live edits, new files, staging, all three views, folder clicks, sidebar resizing, scrollbar dragging, live configuration reload, all-file exploration, double-Shift fuzzy search, and in-file search.')
         finally:
             if proc.poll() is None:
                 proc.kill()

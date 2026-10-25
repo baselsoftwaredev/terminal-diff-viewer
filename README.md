@@ -1,6 +1,6 @@
 # tdv — terminal diff viewer
 
-A Rust terminal application for browsing Git changes with a mouse or keyboard. The default view shows the full current file, with change markers and a previous-code popup. Includes automatic refresh, new files, optional unified/split diffs, syntax highlighting, line numbers, a file sidebar, a file picker, and change navigation.
+A Rust terminal application for browsing Git changes with a mouse or keyboard. The default view shows the full current file, with change markers and a previous-code popup. Includes automatic refresh, new files, optional unified/split diffs, syntax highlighting, line numbers, a collapsible changed/all-files explorer, fuzzy file search, in-file text search, and change navigation.
 
 ## Install on another Mac or Linux machine
 
@@ -53,6 +53,7 @@ The compiled executable does not require Rust to run. Build for each operating s
 
 ```sh
 tdv                         # Working-tree edits and new, untracked files
+tdv --all-files             # Browse the entire repository, including unchanged files
 tdv --staged                # Index compared to HEAD
 tdv --base HEAD             # Working-tree changes and new files against HEAD
 tdv --base main -- src      # Compare src against main
@@ -146,8 +147,11 @@ Checks have a five-second network timeout and never block scrolling or quitting.
 | Start/end of file | Home/End, g/G | |
 | Current/unified/split view | v | Click view in top bar |
 | Staged/unstaged | s | Click source in top bar |
-| Find a file | Ctrl+P, `/`, double-Shift where supported | Click Find file in top bar |
-| Select in file picker | Up/Down, Enter; Esc closes | |
+| Changed/all-files explorer | e | Click Changes / All files in top bar |
+| Fuzzy find any file | Ctrl+P, `/`, double-Shift where supported | Click Find file in top bar |
+| Find text in current file | Ctrl+F; Enter keeps results; Esc clears | |
+| Next/previous text match | F3 / Shift+F3 | |
+| Select in file picker | Up/Down, Enter; Esc closes | Click a result; wheel moves selection |
 | Hide/show file list | f | Double-click a file to hide the list |
 | Refresh | r | |
 | Reload configuration | Shift+R | |
@@ -165,7 +169,13 @@ icons = true
 
 Touch input depends on the terminal: taps and drags work when it forwards them as mouse clicks and drags. Native touch gestures are not handled directly, and physical touchscreen behavior has not been verified.
 
-The file picker filters by a case-insensitive substring of the path. Double-click means two clicks on the same file within 400 ms. Double-Shift means two standalone Shift presses within 400 ms; it requires a terminal that reports modifier keys through the Kitty keyboard protocol. Ctrl+P and `/` are the portable alternatives.
+Press `e` or click the top-bar mode to toggle **Changes** and **All files**. The default Changes sidebar contains only files with Git changes; All files also lists unchanged files. Launch with `tdv --all-files` to start in the full explorer. Filenames are catalogued without reading all unchanged file contents; previews load when selected. Selecting an unchanged file opens its full contents in Current view. In staged mode, the explorer reads the index and excludes untracked files; in unstaged mode, it reads the working tree and includes non-ignored untracked files. Git path filters still apply. Ignored untracked files, `.git` internals, and submodule contents are excluded.
+
+The file picker searches **all files** in either sidebar mode. Matching is case-insensitive and fuzzy: letters can be separated, filename prefixes and word boundaries rank higher, and space-separated terms must all match. For example, `lfn cs` can find `src/LongFileName.cs`. Results are ranked, then sorted by path for ties. Double-Shift and Ctrl+P open the same picker. Selecting an unchanged result switches to All files and reveals its parent directories. No matching results show an explicit empty state.
+
+Press `Ctrl+F` to search for literal, case-sensitive text in the selected file. This opens the full Current view, searches all its lines, highlights matching text, and scrolls to the first match as you type. Press Enter to keep the highlights, then `F3` / `Shift+F3` to move through individual occurrences with wraparound. Esc clears the query and highlights. Syntax colors remain on the surrounding text. This searches the current file, not the whole repository.
+
+Double-click means two clicks on the same file within 400 ms. Double-Shift means two standalone Shift presses within 400 ms; it requires a terminal that reports modifier keys through the Kitty keyboard protocol. Ctrl+P and `/` are the portable alternatives.
 
 ## Portability and current scope
 
@@ -175,7 +185,7 @@ When enabled, syntax highlighting runs on a background thread using Syntect's bu
 
 Unknown languages and large files keep basic colors. Highlighting skips files over 512 KiB or 10,000 lines of combined patch/current text, 8,192 bytes in a line, or 50,000 syntax tokens. The current-file highlighter parses the complete file, preserving multiline context. Diff and previous-code highlighting use available patch context and reset at each hunk, so constructs beginning outside that context may be colored approximately. Cancellation is checked between lines; a slow regex may delay the next file's highlighting, while the interface continues to work.
 
-The file list includes changed tracked files, staged additions, and untracked files in unstaged views. Renames appear as deletion/addition pairs. It does not edit files, stage changes, or browse unchanged files that have no Git changes. File contents are loaded on selection and by background refresh. Paths with unusual characters may appear in Git's quoted format in plain patches. Tabs display as four spaces, and terminal control characters are replaced for display. Plain-text output bypasses syntax highlighting entirely.
+The default Changes list includes changed tracked files, staged additions, and untracked files in unstaged views. Renames appear as deletion/addition pairs. It does not edit files or stage changes. The All files explorer and fuzzy picker can also open unchanged repository files. File contents are loaded on selection and by background refresh. Paths with unusual characters may appear in Git's quoted format in plain patches. Tabs display as four spaces, and terminal control characters are replaced for display. Plain-text output bypasses syntax highlighting entirely.
 
 Validation:
 
